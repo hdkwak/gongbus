@@ -1,6 +1,5 @@
 # Build stage
-# Use nightly to satisfy high MSRV requirements (1.86+) of new dependency versions
-FROM rustlang/rust:nightly-slim-bookworm as builder
+FROM rust:nightly-slim-bookworm as builder
 
 WORKDIR /app
 
