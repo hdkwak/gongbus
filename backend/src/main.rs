@@ -6,7 +6,8 @@ use axum::{
 };
 use fitparser::Value;
 use serde::{Deserialize, Serialize};
-use sqlx::{postgres::PgPool, FromRow, Row};
+use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::{FromRow, Row};
 use std::io::Cursor;
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
@@ -14,11 +15,20 @@ use tracing::{info, error};
 use futures_util::StreamExt;
 use reqwest::multipart as req_multipart;
 use sha1::{Sha1, Digest};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Clone)]
 struct AppState {
-    db: PgPool,
+    db: Arc<RwLock<Option<PgPool>>>,
     cloudinary_config: CloudinaryConfig,
+}
+
+impl AppState {
+    async fn get_db(&self) -> Result<PgPool, (StatusCode, String)> {
+        let db = self.db.read().await;
+        db.clone().ok_or((StatusCode::SERVICE_UNAVAILABLE, "Database not ready yet. Please try again in a few seconds.".to_string()))
+    }
 }
 
 #[derive(Clone)]
@@ -122,14 +132,17 @@ struct CommentPayload {
     comment_text: String,
 }
 
+#[derive(Deserialize)]
+struct LikePayload {
+    user_id: i32,
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string()).parse().unwrap();
-    info!("Starting server on port {}", port);
-
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let cloudinary_config = CloudinaryConfig {
         cloud_name: std::env::var("CLOUDINARY_CLOUD_NAME").unwrap_or_default(),
@@ -137,33 +150,35 @@ async fn main() {
         api_secret: std::env::var("CLOUDINARY_API_SECRET").unwrap_or_default(),
     };
 
-    info!("Connecting to database...");
+    let db_holder = Arc::new(RwLock::new(None));
+    let state = AppState { db: db_holder.clone(), cloudinary_config };
 
-    let mut retry_count = 0;
-    let pool = loop {
-        match sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(std::time::Duration::from_secs(60))
-            .connect(&db_url)
-            .await
-        {
-            Ok(p) => {
-                info!("Database connected successfully.");
-                break p;
-            },
-            Err(e) => {
-                retry_count += 1;
-                if retry_count > 5 {
-                    panic!("FATAL: Failed to connect to Postgres after 5 retries: {:?}", e);
+    // Start background database connection
+    let db_url_clone = db_url.clone();
+    tokio::spawn(async move {
+        info!("Connecting to database in background...");
+        let mut retry_count = 0;
+        loop {
+            match PgPoolOptions::new()
+                .max_connections(2)
+                .acquire_timeout(std::time::Duration::from_secs(30))
+                .connect(&db_url_clone)
+                .await
+            {
+                Ok(pool) => {
+                    info!("Database connected successfully!");
+                    let mut lock = db_holder.write().await;
+                    *lock = Some(pool);
+                    break;
                 }
-                error!("Database connection attempt {} failed: {:?}. Retrying in 5s...", retry_count, e);
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Err(e) => {
+                    retry_count += 1;
+                    error!("Connection attempt {} failed: {:?}. Retrying in 10s...", retry_count, e);
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
             }
         }
-    };
-
-    info!("Database connected successfully.");
-    let state = AppState { db: pool, cloudinary_config };
+    });
 
     let app = Router::new()
         .route("/feed", get(get_feed))
@@ -180,23 +195,25 @@ async fn main() {
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("Listening on {}", addr);
+    info!("Server starting on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
 async fn get_user_profile(State(state): State<AppState>, Path(id): Path<i32>) -> Result<Json<UserProfile>, (StatusCode, String)> {
+    let db = state.get_db().await?;
     let user = sqlx::query_as::<_, UserProfile>("SELECT id, username, avatar_url, marathon_goal_sec, weekly_target_km, monthly_target_km, target_lsd_count, target_race, race_date FROM users WHERE id = $1")
         .bind(id)
-        .fetch_optional(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .fetch_optional(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "User not found".to_string()))?;
     Ok(Json(user))
 }
 
 async fn update_user_profile(State(state): State<AppState>, Path(id): Path<i32>, Json(payload): Json<UserProfile>) -> Result<StatusCode, (StatusCode, String)> {
+    let db = state.get_db().await?;
     sqlx::query("UPDATE users SET username = $1, avatar_url = $2, marathon_goal_sec = $3, weekly_target_km = $4, monthly_target_km = $5, target_lsd_count = $6, target_race = $7, race_date = $8 WHERE id = $9")
         .bind(payload.username).bind(payload.avatar_url).bind(payload.marathon_goal_sec).bind(payload.weekly_target_km).bind(payload.monthly_target_km).bind(payload.target_lsd_count).bind(payload.target_race).bind(payload.race_date).bind(id)
-        .execute(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .execute(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::OK)
 }
 
@@ -223,6 +240,7 @@ async fn upload_avatar(State(state): State<AppState>, mut multipart: Multipart) 
 }
 
 async fn upload_run(State(state): State<AppState>, mut multipart: Multipart) -> Result<StatusCode, (StatusCode, String)> {
+    let db = state.get_db().await?;
     let mut data = Vec::new();
     let mut user_id = 1;
     while let Some(mut field) = multipart.next_field().await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))? {
@@ -313,46 +331,52 @@ async fn upload_run(State(state): State<AppState>, mut multipart: Multipart) -> 
     let ts_json = serde_json::to_value(ts_final).unwrap_or(serde_json::Value::Null);
     sqlx::query("INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, avg_cadence, total_calories) VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10, $11) ON CONFLICT (user_id, start_time) DO UPDATE SET title=EXCLUDED.title, distance_meters=EXCLUDED.distance_meters, duration_seconds=EXCLUDED.duration_seconds, route_line=EXCLUDED.route_line, time_series_data=EXCLUDED.time_series_data, avg_heart_rate=EXCLUDED.avg_heart_rate, max_heart_rate=EXCLUDED.max_heart_rate, avg_cadence=EXCLUDED.avg_cadence, total_calories=EXCLUDED.total_calories")
         .bind(user_id).bind("Morning Run").bind(start_time).bind(final_distance as i32).bind(final_duration).bind(wkt).bind(ts_json).bind(avg_hr).bind(max_hr).bind(avg_cad).bind(calories)
-        .execute(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .execute(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::CREATED)
 }
 
 async fn get_feed(State(state): State<AppState>, Query(pagination): Query<Pagination>) -> Json<Vec<ActivityFeedItem>> {
+    let db = match state.get_db().await { Ok(d) => d, Err(_) => return Json(vec![]) };
     let per_page = pagination.per_page.unwrap_or(20) as i64;
     let offset = (pagination.page.unwrap_or(1) as i64 - 1) * per_page;
     let activities = sqlx::query_as::<_, ActivityFeedItem>(
         r#"SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a JOIN users u ON a.user_id = u.id ORDER BY a.start_time DESC LIMIT $1 OFFSET $2"#
-    ).bind(per_page).bind(offset).fetch_all(&state.db).await.unwrap_or_default();
+    ).bind(per_page).bind(offset).fetch_all(&db).await.unwrap_or_default();
     Json(activities)
 }
 
 async fn get_activity(State(state): State<AppState>, Path(id): Path<i32>) -> Result<Json<ActivityDetail>, (StatusCode, String)> {
-    let row = sqlx::query("SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, a.time_series_data, u.username, u.avatar_url, a.avg_heart_rate, a.max_heart_rate, a.avg_cadence, a.total_calories FROM activities a JOIN users u ON a.user_id = u.id WHERE a.id = $1").bind(id).fetch_optional(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?.ok_or((StatusCode::NOT_FOUND, "Not found".to_string()))?;
-    let comments = sqlx::query_as::<_, Comment>("SELECT u.username, u.avatar_url, c.comment_text, c.created_at FROM activity_comments c JOIN users u ON c.user_id = u.id WHERE c.activity_id = $1 ORDER BY c.created_at ASC").bind(id).fetch_all(&state.db).await.unwrap_or_default();
+    let db = state.get_db().await?;
+    let row = sqlx::query("SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, a.time_series_data, u.username, u.avatar_url, a.avg_heart_rate, a.max_heart_rate, a.avg_cadence, a.total_calories FROM activities a JOIN users u ON a.user_id = u.id WHERE a.id = $1").bind(id).fetch_optional(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?.ok_or((StatusCode::NOT_FOUND, "Not found".to_string()))?;
+    let comments = sqlx::query_as::<_, Comment>("SELECT u.username, u.avatar_url, c.comment_text, c.created_at FROM activity_comments c JOIN users u ON c.user_id = u.id WHERE c.activity_id = $1 ORDER BY c.created_at ASC").bind(id).fetch_all(&db).await.unwrap_or_default();
     Ok(Json(ActivityDetail { id: row.get(0), title: row.get(1), start_time: row.get(2), distance_meters: row.get(3), duration_seconds: row.get(4), route_line_geojson: row.get(5), time_series_data: row.get(6), username: row.get(7), avatar_url: row.get(8), avg_heart_rate: row.get(9), max_heart_rate: row.get(10), avg_cadence: row.get(11), total_calories: row.get(12), comments }))
 }
 
 async fn get_dashboard(State(state): State<AppState>, Path(user_id): Path<i32>) -> Json<Dashboard> {
-    let stats = sqlx::query("SELECT COALESCE(SUM(distance_meters) FILTER (WHERE start_time >= date_trunc('week', now())), 0)::bigint, COALESCE(SUM(distance_meters) FILTER (WHERE start_time >= date_trunc('month', now())), 0)::bigint FROM activities WHERE user_id = $1").bind(user_id).fetch_one(&state.db).await.unwrap();
-    let weekly_trend = sqlx::query_as::<_, WeeklyMileage>("SELECT date_trunc('week', start_time)::date as week_start, COALESCE(SUM(distance_meters), 0)::bigint as distance_meters FROM activities WHERE user_id = $1 GROUP BY week_start ORDER BY week_start ASC LIMIT 10").bind(user_id).fetch_all(&state.db).await.unwrap_or_default();
-    let activities = sqlx::query_as::<_, ActivityFeedItem>(r#"SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a JOIN users u ON a.user_id = u.id WHERE a.user_id = $1 ORDER BY a.start_time DESC"#).bind(user_id).fetch_all(&state.db).await.unwrap_or_default();
+    let db = match state.get_db().await { Ok(d) => d, Err(_) => return Json(Dashboard { weekly_total_meters: 0, monthly_total_meters: 0, weekly_trend: vec![], activities: vec![] }) };
+    let stats = sqlx::query("SELECT COALESCE(SUM(distance_meters) FILTER (WHERE start_time >= date_trunc('week', now())), 0)::bigint, COALESCE(SUM(distance_meters) FILTER (WHERE start_time >= date_trunc('month', now())), 0)::bigint FROM activities WHERE user_id = $1").bind(user_id).fetch_one(&db).await.unwrap();
+    let weekly_trend = sqlx::query_as::<_, WeeklyMileage>("SELECT date_trunc('week', start_time)::date as week_start, COALESCE(SUM(distance_meters), 0)::bigint as distance_meters FROM activities WHERE user_id = $1 GROUP BY week_start ORDER BY week_start ASC LIMIT 10").bind(user_id).fetch_all(&db).await.unwrap_or_default();
+    let activities = sqlx::query_as::<_, ActivityFeedItem>(r#"SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a JOIN users u ON a.user_id = u.id WHERE a.user_id = $1 ORDER BY a.start_time DESC"#).bind(user_id).fetch_all(&db).await.unwrap_or_default();
     Json(Dashboard { weekly_total_meters: stats.get(0), monthly_total_meters: stats.get(1), weekly_trend, activities })
 }
 
 async fn delete_activity(State(state): State<AppState>, Path(id): Path<i32>) -> Result<StatusCode, (StatusCode, String)> {
-    sqlx::query("DELETE FROM activities WHERE id = $1").bind(id).execute(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let db = state.get_db().await?;
+    sqlx::query("DELETE FROM activities WHERE id = $1").bind(id).execute(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn like_activity(State(state): State<AppState>, Path(id): Path<i32>, Json(payload): Json<serde_json::Value>) -> Result<StatusCode, (StatusCode, String)> {
-    let user_id = payload["user_id"].as_i64().unwrap_or(1) as i32;
-    let existing = sqlx::query("SELECT id FROM activity_likes WHERE activity_id = $1 AND user_id = $2").bind(id).bind(user_id).fetch_optional(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if existing.is_some() { sqlx::query("DELETE FROM activity_likes WHERE activity_id = $1 AND user_id = $2").bind(id).bind(user_id).execute(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?; }
-    else { sqlx::query("INSERT INTO activity_likes (activity_id, user_id) VALUES ($1, $2)").bind(id).bind(user_id).execute(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?; }
+async fn like_activity(State(state): State<AppState>, Path(id): Path<i32>, Json(payload): Json<LikePayload>) -> Result<StatusCode, (StatusCode, String)> {
+    let db = state.get_db().await?;
+    let user_id = payload.user_id;
+    let existing = sqlx::query("SELECT id FROM activity_likes WHERE activity_id = $1 AND user_id = $2").bind(id).bind(user_id).fetch_optional(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if existing.is_some() { sqlx::query("DELETE FROM activity_likes WHERE activity_id = $1 AND user_id = $2").bind(id).bind(user_id).execute(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?; }
+    else { sqlx::query("INSERT INTO activity_likes (activity_id, user_id) VALUES ($1, $2)").bind(id).bind(user_id).execute(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?; }
     Ok(StatusCode::OK)
 }
 
 async fn comment_activity(State(state): State<AppState>, Path(id): Path<i32>, Json(payload): Json<CommentPayload>) -> Result<StatusCode, (StatusCode, String)> {
-    sqlx::query("INSERT INTO activity_comments (activity_id, user_id, comment_text) VALUES ($1, $2, $3)").bind(id).bind(payload.user_id).bind(payload.comment_text).execute(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let db = state.get_db().await?;
+    sqlx::query("INSERT INTO activity_comments (activity_id, user_id, comment_text) VALUES ($1, $2, $3)").bind(id).bind(payload.user_id).bind(payload.comment_text).execute(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::CREATED)
 }
