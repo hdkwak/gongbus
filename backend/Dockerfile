@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:nightly-slim-bookworm as builder
+FROM rust:1.85-slim-bookworm as builder
 
 WORKDIR /app
 
@@ -8,8 +8,8 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 
 COPY . .
 
-# Delete the lockfile to ensure the compiler picks versions compatible with this environment
-RUN rm -f Cargo.lock && cargo build --release
+# Build the application
+RUN cargo build --release
 
 # Run stage
 FROM debian:bookworm-slim
