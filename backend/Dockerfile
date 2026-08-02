@@ -8,8 +8,8 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 
 COPY . .
 
-# Build the application
-RUN cargo build --release
+# Force a clean build with the pinned versions in Cargo.toml
+RUN rm -f Cargo.lock && cargo build --release
 
 # Run stage
 FROM debian:bookworm-slim
