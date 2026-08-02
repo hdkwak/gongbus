@@ -186,7 +186,8 @@ interface RunningApi {
     suspend fun uploadRun(@Part file: MultipartBody.Part, @Part("user_id") userId: Int)
 
     companion object {
-        private const val BASE_URL = "http://192.168.0.176:3000/"
+        private const val BASE_URL = "https://gongbus-api.onrender.com/" // REPLACE WITH YOUR RENDER URL
+
         fun create(): RunningApi = Retrofit.Builder()
             .baseUrl(BASE_URL)
             .addConverterFactory(GsonConverterFactory.create())

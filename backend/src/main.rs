@@ -13,6 +13,7 @@ use tower_http::cors::CorsLayer;
 use tracing::{info, error};
 use futures_util::StreamExt;
 use reqwest::multipart as req_multipart;
+use sha1::{Sha1, Digest};
 
 #[derive(Clone)]
 struct AppState {
@@ -229,7 +230,10 @@ async fn upload_avatar(
     // Cloudinary Upload Logic
     let timestamp = chrono::Utc::now().timestamp().to_string();
     let signature_string = format!("timestamp={}{}", timestamp, state.cloudinary_config.api_secret);
-    let signature = format!("{:x}", sha1::Sha1::from(signature_string).digest());
+
+    let mut hasher = Sha1::new();
+    hasher.update(signature_string.as_bytes());
+    let signature = format!("{:x}", hasher.finalize());
 
     let client = reqwest::Client::new();
     let form = req_multipart::Form::new()
