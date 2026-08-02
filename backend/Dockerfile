@@ -1,5 +1,6 @@
 # Build stage
-FROM rust:1.85-slim-bookworm as builder
+# Using Beta image to satisfy dependencies requiring Rust 1.86+
+FROM rust:beta-slim-bookworm as builder
 
 WORKDIR /app
 
@@ -8,8 +9,8 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 
 COPY . .
 
-# Force a clean build with the pinned versions in Cargo.toml
-RUN rm -f Cargo.lock && cargo build --release
+# Build the application
+RUN cargo build --release
 
 # Run stage
 FROM debian:bookworm-slim
