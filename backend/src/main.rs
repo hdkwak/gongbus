@@ -10,7 +10,7 @@ use sqlx::{postgres::PgPool, FromRow, Row};
 use std::io::Cursor;
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
-use tracing::{info, error};
+use tracing::info;
 use futures_util::StreamExt;
 use reqwest::multipart as req_multipart;
 use sha1::{Sha1, Digest};
@@ -292,7 +292,7 @@ async fn upload_run(State(state): State<AppState>, mut multipart: Multipart) -> 
 
 async fn get_feed(State(state): State<AppState>, Query(pagination): Query<Pagination>) -> Json<Vec<ActivityFeedItem>> {
     let per_page = pagination.per_page.unwrap_or(20) as i64;
-    let offset = ((pagination.page.unwrap_or(1) - 1) * per_page) as i64;
+    let offset = (pagination.page.unwrap_or(1) as i64 - 1) * per_page;
     let activities = sqlx::query_as::<_, ActivityFeedItem>(
         r#"SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a JOIN users u ON a.user_id = u.id ORDER BY a.start_time DESC LIMIT $1 OFFSET $2"#
     ).bind(per_page).bind(offset).fetch_all(&state.db).await.unwrap_or_default();
