@@ -10,7 +10,7 @@ use sqlx::{postgres::PgPool, FromRow, Row};
 use std::io::Cursor;
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{info, error};
 use futures_util::StreamExt;
 use reqwest::multipart as req_multipart;
 use sha1::{Sha1, Digest};
