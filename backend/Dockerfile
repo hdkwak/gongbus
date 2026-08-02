@@ -1,6 +1,5 @@
 # Build stage
-# Explicitly use 1.86 to satisfy new dependency requirements
-FROM rust:1.86.0-slim-bookworm as builder
+FROM rust:1.85-slim-bookworm as builder
 
 WORKDIR /app
 
@@ -9,8 +8,9 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 
 COPY . .
 
-# Build the application
-RUN cargo build --release
+# CRITICAL FIX: Force downgrade of the broken 'home' crate before building
+# This resolves the "requires rustc 1.88" error
+RUN cargo update -p home --precise 0.5.11 && cargo build --release
 
 # Run stage
 FROM debian:bookworm-slim
