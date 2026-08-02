@@ -137,6 +137,11 @@ async fn main() {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
         .acquire_timeout(std::time::Duration::from_secs(30))
+        // Required for Supabase Pooler (IPv4)
+        .after_connect(|conn, _meta| Box::pin(async move {
+            sqlx::query("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(conn).await?;
+            Ok(())
+        }))
         .connect(&db_url)
         .await
         .expect("Failed to connect to Postgres");
