@@ -138,12 +138,27 @@ async fn main() {
     };
 
     info!("Connecting to database...");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(3)
-        .acquire_timeout(std::time::Duration::from_secs(60))
-        .connect(&db_url)
-        .await
-        .expect("Failed to connect to Postgres");
+
+    // Attempt connection with retries
+    let mut retry_count = 0;
+    let pool = loop {
+        match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect(&db_url)
+            .await
+        {
+            Ok(p) => break p,
+            Err(e) => {
+                retry_count += 1;
+                if retry_count > 3 {
+                    panic!("Failed to connect to Postgres after 3 retries: {:?}", e);
+                }
+                error!("Database connection failed: {:?}. Retrying in 5s...", e);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    };
 
     info!("Database connected successfully.");
     let state = AppState { db: pool, cloudinary_config };
