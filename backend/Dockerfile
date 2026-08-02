@@ -3,16 +3,10 @@ FROM rust:1.85-slim-bookworm as builder
 
 WORKDIR /app
 
-# Optimization: Pre-install build dependencies
+# Install build dependencies
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
-# Copy only the dependency files first to cache them
-COPY Cargo.toml Cargo.lock ./
-# Create a dummy main.rs to build dependencies only
-RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
-
-# Now copy the actual source code and build the real app
-COPY src ./src
+COPY . .
 RUN cargo build --release
 
 # Run stage
