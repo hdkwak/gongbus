@@ -8,8 +8,10 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 
 COPY . .
 
-# Force a clean dependency resolution with our explicit patches
-RUN rm -f Cargo.lock && cargo build --release
+# CRITICAL FIX: Force specific working versions for crates currently broken in the ecosystem
+RUN cargo update -p home --precise 0.5.11 && \
+    cargo update -p idna --precise 0.5.0 && \
+    cargo build --release
 
 # Run stage
 FROM debian:bookworm-slim
