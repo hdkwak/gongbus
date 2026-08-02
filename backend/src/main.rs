@@ -139,22 +139,24 @@ async fn main() {
 
     info!("Connecting to database...");
 
-    // Attempt connection with retries
     let mut retry_count = 0;
     let pool = loop {
         match sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
-            .acquire_timeout(std::time::Duration::from_secs(30))
+            .acquire_timeout(std::time::Duration::from_secs(60))
             .connect(&db_url)
             .await
         {
-            Ok(p) => break p,
+            Ok(p) => {
+                info!("Database connected successfully.");
+                break p;
+            },
             Err(e) => {
                 retry_count += 1;
-                if retry_count > 3 {
-                    panic!("Failed to connect to Postgres after 3 retries: {:?}", e);
+                if retry_count > 5 {
+                    panic!("FATAL: Failed to connect to Postgres after 5 retries: {:?}", e);
                 }
-                error!("Database connection failed: {:?}. Retrying in 5s...", e);
+                error!("Database connection attempt {} failed: {:?}. Retrying in 5s...", retry_count, e);
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         }
