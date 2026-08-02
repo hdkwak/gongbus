@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 
 COPY . .
 
-# CRITICAL: Remove the lockfile to force Cargo to use the pinned versions in Cargo.toml
+# Force a clean dependency resolution with our patches
 RUN rm -f Cargo.lock && cargo build --release
 
 # Run stage
