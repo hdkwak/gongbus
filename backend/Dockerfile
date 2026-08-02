@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 
 COPY . .
 
-# Force a clean dependency resolution with our patches
+# Force a clean dependency resolution with our explicit patches
 RUN rm -f Cargo.lock && cargo build --release
 
 # Run stage

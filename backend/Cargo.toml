@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1.0", features = ["full"] }
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "macros", "json"] }
+sqlx = { version = "0.7.3", features = ["runtime-tokio-rustls", "postgres", "chrono", "macros", "json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
@@ -20,12 +20,12 @@ uuid = { version = "1.0", features = ["v4"] }
 reqwest = { version = "0.11", features = ["json", "multipart"] }
 sha1 = "0.10"
 
-# FORCED PATCHES: This overrides transitive dependencies to fix the Rust 1.85 build failure
+# FORCED PATCHES: Using exact versions (=) as required by Cargo to resolve Rust 1.85 issues
 [patch.crates-io]
-home = { package = "home", version = "0.5.11" }
-idna = { package = "idna", version = "0.5.0" }
-icu_locid = { package = "icu_locid", version = "1.5.0" }
-icu_collections = { package = "icu_collections", version = "1.5.0" }
-icu_properties = { package = "icu_properties", version = "1.5.0" }
-icu_provider = { package = "icu_provider", version = "1.5.0" }
-icu_normalizer = { package = "icu_normalizer", version = "1.5.0" }
+home = { package = "home", version = "=0.5.11" }
+idna = { package = "idna", version = "=0.5.0" }
+icu_locid = { package = "icu_locid", version = "=1.5.0" }
+icu_collections = { package = "icu_collections", version = "=1.5.0" }
+icu_properties = { package = "icu_properties", version = "=1.5.0" }
+icu_provider = { package = "icu_provider", version = "=1.5.0" }
+icu_normalizer = { package = "icu_normalizer", version = "=1.5.0" }
