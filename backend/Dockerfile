@@ -8,15 +8,8 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 
 COPY . .
 
-# CRITICAL FIX: Force downgrade of several broken crates that require unreleased Rust versions
-RUN cargo update -p home --precise 0.5.11 && \
-    cargo update -p icu_locid --precise 1.5.0 && \
-    cargo update -p icu_collections --precise 1.5.0 && \
-    cargo update -p icu_properties --precise 1.5.0 && \
-    cargo update -p icu_provider --precise 1.5.0 && \
-    cargo update -p icu_normalizer --precise 1.5.0 && \
-    cargo update -p idna --precise 0.5.0 && \
-    cargo build --release
+# CRITICAL: Remove the lockfile to force Cargo to use the pinned versions in Cargo.toml
+RUN rm -f Cargo.lock && cargo build --release
 
 # Run stage
 FROM debian:bookworm-slim

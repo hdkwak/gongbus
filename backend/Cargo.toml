@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1.0", features = ["full"] }
-sqlx = { version = "0.7.3", features = ["runtime-tokio-rustls", "postgres", "chrono", "macros", "json"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "macros", "json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
@@ -19,3 +19,8 @@ tracing-subscriber = "0.3"
 uuid = { version = "1.0", features = ["v4"] }
 reqwest = { version = "0.11", features = ["json", "multipart"] }
 sha1 = "0.10"
+
+# EXPLICIT PINS to fix Rust 1.85 compatibility
+# These prevent dependencies from pulling in broken versions requiring Rust 1.86/1.88
+home = "=0.5.11"
+idna = "=0.5.0"
