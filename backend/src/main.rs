@@ -127,6 +127,9 @@ async fn main() {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string()).parse().unwrap();
+    info!("Starting server on port {}", port);
+
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let cloudinary_config = CloudinaryConfig {
         cloud_name: std::env::var("CLOUDINARY_CLOUD_NAME").unwrap_or_default(),
@@ -134,17 +137,15 @@ async fn main() {
         api_secret: std::env::var("CLOUDINARY_API_SECRET").unwrap_or_default(),
     };
 
+    info!("Connecting to database...");
     let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .acquire_timeout(std::time::Duration::from_secs(30))
-        // Required for Supabase Pooler (IPv4)
-        .after_connect(|conn, _meta| Box::pin(async move {
-            sqlx::query("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(conn).await?;
-            Ok(())
-        }))
+        .max_connections(3)
+        .acquire_timeout(std::time::Duration::from_secs(60))
         .connect(&db_url)
         .await
         .expect("Failed to connect to Postgres");
+
+    info!("Database connected successfully.");
     let state = AppState { db: pool, cloudinary_config };
 
     let app = Router::new()
@@ -161,7 +162,6 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string()).parse().unwrap();
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("Listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
