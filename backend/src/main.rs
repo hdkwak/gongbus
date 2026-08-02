@@ -134,7 +134,12 @@ async fn main() {
         api_secret: std::env::var("CLOUDINARY_API_SECRET").unwrap_or_default(),
     };
 
-    let pool = PgPool::connect(&db_url).await.expect("Failed to connect to Postgres");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .connect(&db_url)
+        .await
+        .expect("Failed to connect to Postgres");
     let state = AppState { db: pool, cloudinary_config };
 
     let app = Router::new()
