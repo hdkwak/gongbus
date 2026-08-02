@@ -1,5 +1,6 @@
 # Build stage
-FROM rust:1.85-slim-bookworm as builder
+# Use nightly to satisfy high MSRV requirements (1.86+) of new dependency versions
+FROM rustlang/rust:nightly-slim-bookworm as builder
 
 WORKDIR /app
 
@@ -7,7 +8,9 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
 COPY . .
-RUN cargo build --release
+
+# Delete the lockfile to ensure the compiler picks versions compatible with this environment
+RUN rm -f Cargo.lock && cargo build --release
 
 # Run stage
 FROM debian:bookworm-slim
