@@ -1,6 +1,6 @@
 # Build stage
-# Using Beta image to satisfy dependencies requiring Rust 1.86+
-FROM rust:beta-slim-bookworm as builder
+# Explicitly use 1.86 to satisfy new dependency requirements
+FROM rust:1.86.0-slim-bookworm as builder
 
 WORKDIR /app
 
