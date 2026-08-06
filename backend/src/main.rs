@@ -149,7 +149,17 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string()).parse().unwrap();
-    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let mut db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+
+    // Force prepared_statements=false for Supabase Pooler compatibility
+    if !db_url.contains("prepared_statements=false") {
+        if db_url.contains('?') {
+            db_url.push_str("&prepared_statements=false");
+        } else {
+            db_url.push_str("?prepared_statements=false");
+        }
+    }
+
     let cloudinary_config = CloudinaryConfig {
         cloud_name: std::env::var("CLOUDINARY_CLOUD_NAME").unwrap_or_default(),
         api_key: std::env::var("CLOUDINARY_API_KEY").unwrap_or_default(),
@@ -160,8 +170,9 @@ async fn main() {
     let opt = opt.disable_statement_logging()
         .statement_cache_capacity(0);
 
-    // DISABLE PREPARED STATEMENTS for Supabase Pooler compatibility
-    // This fixes the "prepared statement already exists" error (code 42P05)
+    // USE SIMPLE PROTOCOL for Supabase Pooler compatibility
+    // This is the most reliable way to fix "prepared statement already exists" (code 42P05)
+    // as it prevents SQLx from using the binary protocol that requires preparation.
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .acquire_timeout(std::time::Duration::from_secs(30))
