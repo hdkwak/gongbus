@@ -369,7 +369,7 @@ async fn get_feed(State(state): State<AppState>, Query(pagination): Query<Pagina
            (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count,
            (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count
            FROM activities a
-           JOIN users u ON a.user_id = u.id
+           LEFT JOIN users u ON a.user_id = u.id
            ORDER BY a.start_time DESC LIMIT $1 OFFSET $2"#
     ).bind(per_page).bind(offset).fetch_all(&db).await.map_err(|e| {
         error!("Feed query failed: {:?}", e);
