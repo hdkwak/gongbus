@@ -161,7 +161,7 @@ async fn main() {
         loop {
             match PgPoolOptions::new()
                 .max_connections(2)
-                .acquire_timeout(std::time::Duration::from_secs(30))
+                .acquire_timeout(std::time::Duration::from_secs(60))
                 .connect(&db_url_clone)
                 .await
             {
@@ -173,7 +173,10 @@ async fn main() {
                 }
                 Err(e) => {
                     retry_count += 1;
-                    error!("Connection attempt {} failed: {:?}. Retrying in 10s...", retry_count, e);
+                    error!("Connection attempt {} failed: {}. Details: {:?}. Retrying in 10s...", retry_count, e, e);
+                    if !db_url_clone.contains("sslmode=require") {
+                        info!("Hint: If you are connecting to a production database (e.g. Render/Neon), ensure 'sslmode=require' is included in your DATABASE_URL.");
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 }
             }
