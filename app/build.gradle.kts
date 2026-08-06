@@ -1,12 +1,14 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
 
-val localProperties = java.util.Properties().apply {
+val localProperties = Properties().apply {
     val localPropertiesFile = rootProject.file("local.properties")
     if (localPropertiesFile.exists()) {
-        load(localPropertiesFile.inputStream())
+        localPropertiesFile.inputStream().use { load(it) }
     }
 }
 

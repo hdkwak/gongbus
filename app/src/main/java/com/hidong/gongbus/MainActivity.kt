@@ -72,7 +72,7 @@ data class ActivityFeedItem(
     val distance_meters: Int?,
     val duration_seconds: Int?,
     val route_line_geojson: Any?,
-    val username: String,
+    val username: String?,
     val avatar_url: String?,
     val avg_heart_rate: Int?,
     val avg_cadence: Int?,
@@ -106,7 +106,7 @@ data class ActivityDetail(
     val duration_seconds: Int?,
     val route_line_geojson: Any?,
     val time_series_data: List<MetricRecord>?,
-    val username: String,
+    val username: String?,
     val avatar_url: String?,
     val avg_heart_rate: Int?,
     val max_heart_rate: Int?,
@@ -121,7 +121,7 @@ data class WeeklyMileage(
 )
 
 data class LeaderboardEntry(
-    val username: String,
+    val username: String?,
     val avatar_url: String?,
     val total_meters: Long
 )
@@ -174,6 +174,9 @@ interface RunningApi {
     @GET("users/{id}")
     suspend fun getUserProfile(@Path("id") id: Int): UserProfile
 
+    @POST("users")
+    suspend fun createProfile(@Body profile: UserProfile): UserProfile
+
     @PUT("users/{id}")
     suspend fun updateUserProfile(@Path("id") id: Int, @Body profile: UserProfile): retrofit2.Response<Unit>
 
@@ -203,6 +206,7 @@ class MainViewModel : ViewModel() {
     var selectedActivity by mutableStateOf<ActivityDetail?>(null)
     var dashboardData by mutableStateOf<DashboardData?>(null)
     var userProfile by mutableStateOf<UserProfile?>(null)
+    var profileNotFound by mutableStateOf(false)
     
     var isFeedLoading by mutableStateOf(false)
     var isDetailLoading by mutableStateOf(false)
@@ -212,29 +216,75 @@ class MainViewModel : ViewModel() {
     var uploadStatus = mutableStateOf<String?>(null)
 
     init { 
-        fetchFeed()
-        fetchDashboard()
         fetchProfile()
+        fetchFeed()
     }
 
     fun fetchFeed() {
         viewModelScope.launch {
             isFeedLoading = true
-            try { activities = api.getFeed() } catch (e: Exception) { e.printStackTrace() } finally { isFeedLoading = false }
+            try { 
+                activities = api.getFeed() 
+            } catch (e: Exception) { 
+                uploadStatus.value = "Feed error: ${e.message}"
+                e.printStackTrace() 
+            } finally { isFeedLoading = false }
         }
     }
 
     fun fetchDashboard() {
+        val userId = userProfile?.id ?: 1
         viewModelScope.launch {
             isDashboardLoading = true
-            try { dashboardData = api.getDashboard(1) } catch (e: Exception) { e.printStackTrace() } finally { isDashboardLoading = false }
+            try { dashboardData = api.getDashboard(userId) } catch (e: Exception) { e.printStackTrace() } finally { isDashboardLoading = false }
         }
     }
 
     fun fetchProfile() {
         viewModelScope.launch {
             isProfileLoading = true
-            try { userProfile = api.getUserProfile(1) } catch (e: Exception) { e.printStackTrace() } finally { isProfileLoading = false }
+            profileNotFound = false
+            try { 
+                // Try to find any user first, then default to 1
+                userProfile = api.getUserProfile(1) 
+                fetchDashboard()
+            } catch (e: Exception) { 
+                if (e.message?.contains("404") == true) {
+                    profileNotFound = true
+                }
+                e.printStackTrace() 
+            } finally { 
+                isProfileLoading = false 
+            }
+        }
+    }
+
+    fun createInitialProfile(context: Context, username: String) {
+        viewModelScope.launch {
+            isProfileLoading = true
+            try {
+                val newProfile = UserProfile(
+                    id = 0,
+                    username = username,
+                    avatar_url = null,
+                    marathon_goal_sec = null,
+                    weekly_target_km = null,
+                    monthly_target_km = null,
+                    target_lsd_count = null,
+                    target_race = null,
+                    race_date = null
+                )
+                val created = api.createProfile(newProfile)
+                userProfile = created
+                profileNotFound = false
+                uploadStatus.value = "Profile created!"
+                fetchFeed()
+                fetchDashboard()
+            } catch (e: Exception) {
+                uploadStatus.value = "Failed to create profile: ${e.message}"
+            } finally {
+                isProfileLoading = false
+            }
         }
     }
 
@@ -242,6 +292,7 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch {
             try {
                 var updatedProfile = profile
+                val userId = userProfile?.id ?: 1
                 
                 if (localAvatarUri != null) {
                     val file = uriToFile(context, localAvatarUri)
@@ -250,7 +301,7 @@ class MainViewModel : ViewModel() {
                     updatedProfile = updatedProfile.copy(avatar_url = response.url)
                 }
 
-                val response = api.updateUserProfile(1, updatedProfile)
+                val response = api.updateUserProfile(userId, updatedProfile)
                 if (response.isSuccessful) {
                     userProfile = updatedProfile
                     uploadStatus.value = "Profile updated"
@@ -285,7 +336,8 @@ class MainViewModel : ViewModel() {
     fun likeActivity(id: Int) {
         viewModelScope.launch {
             try {
-                val response = api.likeActivity(id, LikePayload(user_id = 1))
+                val userId = userProfile?.id ?: 1
+                val response = api.likeActivity(id, LikePayload(user_id = userId))
                 if (response.isSuccessful) {
                     fetchFeed()
                     uploadStatus.value = "Kudos!"
@@ -299,7 +351,8 @@ class MainViewModel : ViewModel() {
     fun addComment(id: Int, text: String) {
         viewModelScope.launch {
             try {
-                val response = api.commentActivity(id, CommentPayload(user_id = 1, comment_text = text))
+                val userId = userProfile?.id ?: 1
+                val response = api.commentActivity(id, CommentPayload(user_id = userId, comment_text = text))
                 if (response.isSuccessful) {
                     fetchFeed()
                     fetchActivityDetail(id) // Refresh comments list
@@ -325,9 +378,10 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch {
             isUploading = true
             try {
+                val userId = userProfile?.id ?: 1
                 val file = uriToFile(context, uri)
                 val body = MultipartBody.Part.createFormData("file", file.name, file.asRequestBody("application/octet-stream".toMediaTypeOrNull()))
-                api.uploadRun(body, 1)
+                api.uploadRun(body, userId)
                 uploadStatus.value = "Upload Successful!"
                 fetchFeed()
                 fetchDashboard()
@@ -559,7 +613,7 @@ fun ActivityCard(activity: ActivityFeedItem, onClick: (Int) -> Unit, onDelete: (
                     }
                     Spacer(Modifier.width(12.dp))
                     Column {
-                        Text(activity.username, fontWeight = FontWeight.Bold)
+                        Text(activity.username ?: "Unknown Runner", fontWeight = FontWeight.Bold)
                         Text(activity.start_time.substringBefore("T"), style = MaterialTheme.typography.bodySmall)
                     }
                 }
@@ -717,7 +771,7 @@ fun LeaderboardSection(entries: List<LeaderboardEntry>) {
                     }
                 }
                 Spacer(Modifier.width(12.dp))
-                Text(text = entry.username, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                Text(text = entry.username ?: "Unknown", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                 Text(
                     text = "%.1f km".format(entry.total_meters / 1000f),
                     style = MaterialTheme.typography.titleSmall,
@@ -800,6 +854,34 @@ fun ProfileScreen(viewModel: MainViewModel) {
     
     if (viewModel.isProfileLoading) {
         Box(Modifier.fillMaxSize(), Alignment.Center) { CircularProgressIndicator() }
+    } else if (viewModel.profileNotFound) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(32.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Icon(Icons.Default.Person, null, modifier = Modifier.size(64.dp), tint = Color.Gray)
+            Spacer(Modifier.height(16.dp))
+            Text("No profile found.", style = MaterialTheme.typography.headlineSmall)
+            Text("Please create your profile to start using Gongbus.", textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+            Spacer(Modifier.height(24.dp))
+            
+            var newUsername by remember { mutableStateOf("") }
+            OutlinedTextField(
+                value = newUsername,
+                onValueChange = { newUsername = it },
+                label = { Text("Enter Username") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = { if (newUsername.isNotEmpty()) viewModel.createInitialProfile(context, newUsername) },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = newUsername.isNotEmpty()
+            ) {
+                Text("Create Profile")
+            }
+        }
     } else if (profile != null) {
         var username by remember { mutableStateOf(profile.username) }
         var avatarUrl by remember { mutableStateOf(profile.avatar_url) }
@@ -980,8 +1062,9 @@ fun ActivityDetailScreen(viewModel: MainViewModel, onBack: () -> Unit) {
             )
         }
     ) { padding ->
-        if (viewModel.isDetailLoading) Box(Modifier.fillMaxSize().padding(padding), Alignment.Center) { CircularProgressIndicator() }
-        else if (activity != null) {
+        if (viewModel.isDetailLoading) {
+            Box(Modifier.fillMaxSize().padding(padding), Alignment.Center) { CircularProgressIndicator() }
+        } else if (activity != null) {
             Column(Modifier.padding(padding).fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), Arrangement.spacedBy(20.dp)) {
                 RouteMap(activity.route_line_geojson, Modifier.height(250.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -1005,6 +1088,20 @@ fun ActivityDetailScreen(viewModel: MainViewModel, onBack: () -> Unit) {
                 MetricChart("Elevation (m)", splits.map { it.avgAltitude })
                 MetricChart("Stride Distance (m)", splits.map { it.avgStrideDistance })
                 MetricChart("Ground Contact Time (ms)", splits.map { it.avgGct })
+            }
+        } else {
+            Box(Modifier.fillMaxSize().padding(padding), Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Default.Error, null, modifier = Modifier.size(64.dp), tint = Color.Gray)
+                    Spacer(Modifier.height(16.dp))
+                    Text("Failed to load activity detail.")
+                    Button(onClick = { 
+                        val id = (viewModel.selectedActivity as? ActivityDetail)?.id 
+                        // Note: we need the ID here. Let's pass it or store it.
+                    }) {
+                        Text("Retry")
+                    }
+                }
             }
         }
     }
