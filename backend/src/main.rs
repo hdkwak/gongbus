@@ -110,7 +110,15 @@ struct Dashboard {
     weekly_total_meters: i64,
     monthly_total_meters: i64,
     weekly_trend: Vec<WeeklyMileage>,
+    leaderboard: Vec<LeaderboardEntry>,
     activities: Vec<ActivityFeedItem>,
+}
+
+#[derive(Serialize, FromRow)]
+struct LeaderboardEntry {
+    username: String,
+    avatar_url: Option<String>,
+    total_meters: i64,
 }
 
 #[derive(Serialize, Deserialize, FromRow)]
@@ -367,11 +375,12 @@ async fn get_activity(State(state): State<AppState>, Path(id): Path<i32>) -> Res
 }
 
 async fn get_dashboard(State(state): State<AppState>, Path(user_id): Path<i32>) -> Json<Dashboard> {
-    let db = match state.get_db().await { Ok(d) => d, Err(_) => return Json(Dashboard { weekly_total_meters: 0, monthly_total_meters: 0, weekly_trend: vec![], activities: vec![] }) };
+    let db = match state.get_db().await { Ok(d) => d, Err(_) => return Json(Dashboard { weekly_total_meters: 0, monthly_total_meters: 0, weekly_trend: vec![], leaderboard: vec![], activities: vec![] }) };
     let stats = sqlx::query("SELECT COALESCE(SUM(distance_meters) FILTER (WHERE start_time >= date_trunc('week', now())), 0)::bigint, COALESCE(SUM(distance_meters) FILTER (WHERE start_time >= date_trunc('month', now())), 0)::bigint FROM activities WHERE user_id = $1").bind(user_id).fetch_one(&db).await.unwrap();
     let weekly_trend = sqlx::query_as::<_, WeeklyMileage>("SELECT date_trunc('week', start_time)::date as week_start, COALESCE(SUM(distance_meters), 0)::bigint as distance_meters FROM activities WHERE user_id = $1 GROUP BY week_start ORDER BY week_start ASC LIMIT 10").bind(user_id).fetch_all(&db).await.unwrap_or_default();
+    let leaderboard = sqlx::query_as::<_, LeaderboardEntry>(r#"SELECT u.username, u.avatar_url, COALESCE(SUM(a.distance_meters), 0)::bigint as total_meters FROM users u JOIN activities a ON u.id = a.user_id WHERE a.start_time >= date_trunc('month', now()) GROUP BY u.id ORDER BY total_meters DESC LIMIT 10"#).fetch_all(&db).await.unwrap_or_default();
     let activities = sqlx::query_as::<_, ActivityFeedItem>(r#"SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a JOIN users u ON a.user_id = u.id WHERE a.user_id = $1 ORDER BY a.start_time DESC"#).bind(user_id).fetch_all(&db).await.unwrap_or_default();
-    Json(Dashboard { weekly_total_meters: stats.get(0), monthly_total_meters: stats.get(1), weekly_trend, activities })
+    Json(Dashboard { weekly_total_meters: stats.get(0), monthly_total_meters: stats.get(1), weekly_trend, leaderboard, activities })
 }
 
 async fn delete_activity(State(state): State<AppState>, Path(id): Path<i32>) -> Result<StatusCode, (StatusCode, String)> {
