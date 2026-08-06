@@ -207,7 +207,7 @@ async fn main() {
 async fn create_user(State(state): State<AppState>, Json(payload): Json<UserProfile>) -> Result<Json<UserProfile>, (StatusCode, String)> {
     let db = state.get_db().await?;
     let row = sqlx::query("INSERT INTO users (username, avatar_url, marathon_goal_sec, weekly_target_km, monthly_target_km, target_lsd_count, target_race, race_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id")
-        .bind(payload.username).bind(payload.avatar_url).bind(payload.marathon_goal_sec).bind(payload.weekly_target_km).bind(payload.monthly_target_km).bind(payload.target_lsd_count).bind(payload.target_race).bind(payload.race_date)
+        .bind(&payload.username).bind(&payload.avatar_url).bind(payload.marathon_goal_sec).bind(payload.weekly_target_km).bind(payload.monthly_target_km).bind(payload.target_lsd_count).bind(&payload.target_race).bind(payload.race_date)
         .fetch_one(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let id: i32 = row.get(0);
