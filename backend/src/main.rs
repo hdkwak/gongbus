@@ -6,8 +6,8 @@ use axum::{
 };
 use fitparser::Value;
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::{FromRow, Row};
+use sqlx::postgres::{PgPool, PgPoolOptions, PgConnectOptions};
+use sqlx::{FromRow, Row, ConnectOptions};
 use std::io::Cursor;
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
@@ -20,14 +20,13 @@ use tokio::sync::RwLock;
 
 #[derive(Clone)]
 struct AppState {
-    db: Arc<RwLock<Option<PgPool>>>,
+    db: PgPool,
     cloudinary_config: CloudinaryConfig,
 }
 
 impl AppState {
     async fn get_db(&self) -> Result<PgPool, (StatusCode, String)> {
-        let db = self.db.read().await;
-        db.clone().ok_or((StatusCode::SERVICE_UNAVAILABLE, "Database not ready yet. Please try again in a few seconds.".to_string()))
+        Ok(self.db.clone())
     }
 }
 
@@ -158,38 +157,19 @@ async fn main() {
         api_secret: std::env::var("CLOUDINARY_API_SECRET").unwrap_or_default(),
     };
 
-    let db_holder = Arc::new(RwLock::new(None));
-    let state = AppState { db: db_holder.clone(), cloudinary_config };
+    let mut opt: PgConnectOptions = db_url.parse().expect("Invalid DATABASE_URL");
+    opt.disable_statement_logging();
 
-    // Start background database connection
-    let db_url_clone = db_url.clone();
-    tokio::spawn(async move {
-        info!("Connecting to database in background...");
-        let mut retry_count = 0;
-        loop {
-            match PgPoolOptions::new()
-                .max_connections(2)
-                .acquire_timeout(std::time::Duration::from_secs(60))
-                .connect(&db_url_clone)
-                .await
-            {
-                Ok(pool) => {
-                    info!("Database connected successfully!");
-                    let mut lock = db_holder.write().await;
-                    *lock = Some(pool);
-                    break;
-                }
-                Err(e) => {
-                    retry_count += 1;
-                    error!("Connection attempt {} failed: {}. Details: {:?}. Retrying in 10s...", retry_count, e, e);
-                    if !db_url_clone.contains("sslmode=require") {
-                        info!("Hint: If you are connecting to a production database (e.g. Render/Neon), ensure 'sslmode=require' is included in your DATABASE_URL.");
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                }
-            }
-        }
-    });
+    // DISABLE PREPARED STATEMENTS for Supabase Pooler compatibility
+    // This fixes the "prepared statement already exists" error (code 42P05)
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .connect_with(opt.clone().statement_cache_capacity(0))
+        .await
+        .expect("Failed to create database pool");
+
+    let state = AppState { db: pool, cloudinary_config };
 
     let app = Router::new()
         .route("/feed", get(get_feed))
