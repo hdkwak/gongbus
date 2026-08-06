@@ -15,8 +15,7 @@ use tracing::{info, error};
 use futures_util::StreamExt;
 use reqwest::multipart as req_multipart;
 use sha1::{Sha1, Digest};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::net::TcpListener;
 
 #[derive(Clone)]
 struct AppState {
@@ -157,15 +156,16 @@ async fn main() {
         api_secret: std::env::var("CLOUDINARY_API_SECRET").unwrap_or_default(),
     };
 
-    let mut opt: PgConnectOptions = db_url.parse().expect("Invalid DATABASE_URL");
-    opt.disable_statement_logging();
+    let opt: PgConnectOptions = db_url.parse().expect("Invalid DATABASE_URL");
+    let opt = opt.disable_statement_logging()
+        .statement_cache_capacity(0);
 
     // DISABLE PREPARED STATEMENTS for Supabase Pooler compatibility
     // This fixes the "prepared statement already exists" error (code 42P05)
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect_with(opt.clone().statement_cache_capacity(0))
+        .connect_with(opt)
         .await
         .expect("Failed to create database pool");
 
@@ -381,13 +381,31 @@ async fn get_activity(State(state): State<AppState>, Path(id): Path<i32>) -> Res
     }))
 }
 
-async fn get_dashboard(State(state): State<AppState>, Path(user_id): Path<i32>) -> Json<Dashboard> {
-    let db = match state.get_db().await { Ok(d) => d, Err(_) => return Json(Dashboard { weekly_total_meters: 0, monthly_total_meters: 0, weekly_trend: vec![], leaderboard: vec![], activities: vec![] }) };
-    let stats = sqlx::query("SELECT COALESCE(SUM(distance_meters) FILTER (WHERE start_time >= date_trunc('week', now())), 0)::bigint, COALESCE(SUM(distance_meters) FILTER (WHERE start_time >= date_trunc('month', now())), 0)::bigint FROM activities WHERE user_id = $1").bind(user_id).fetch_one(&db).await.unwrap();
-    let weekly_trend = sqlx::query_as::<_, WeeklyMileage>("SELECT date_trunc('week', start_time)::date as week_start, COALESCE(SUM(distance_meters), 0)::bigint as distance_meters FROM activities WHERE user_id = $1 GROUP BY week_start ORDER BY week_start ASC LIMIT 10").bind(user_id).fetch_all(&db).await.unwrap_or_default();
-    let leaderboard = sqlx::query_as::<_, LeaderboardEntry>(r#"SELECT u.username, u.avatar_url, COALESCE(SUM(a.distance_meters), 0)::bigint as total_meters FROM users u JOIN activities a ON u.id = a.user_id WHERE a.start_time >= date_trunc('month', now()) GROUP BY u.id ORDER BY total_meters DESC LIMIT 10"#).fetch_all(&db).await.unwrap_or_default();
-    let activities = sqlx::query_as::<_, ActivityFeedItem>(r#"SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.user_id = $1 ORDER BY a.start_time DESC"#).bind(user_id).fetch_all(&db).await.unwrap_or_default();
-    Json(Dashboard { weekly_total_meters: stats.get(0), monthly_total_meters: stats.get(1), weekly_trend, leaderboard, activities })
+async fn get_dashboard(State(state): State<AppState>, Path(user_id): Path<i32>) -> Result<Json<Dashboard>, (StatusCode, String)> {
+    let db = state.get_db().await?;
+
+    let stats = sqlx::query("SELECT COALESCE(SUM(distance_meters) FILTER (WHERE start_time >= date_trunc('week', now())), 0)::bigint, COALESCE(SUM(distance_meters) FILTER (WHERE start_time >= date_trunc('month', now())), 0)::bigint FROM activities WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let weekly_trend = sqlx::query_as::<_, WeeklyMileage>("SELECT date_trunc('week', start_time)::date as week_start, COALESCE(SUM(distance_meters), 0)::bigint as distance_meters FROM activities WHERE user_id = $1 GROUP BY week_start ORDER BY week_start ASC LIMIT 10")
+        .bind(user_id)
+        .fetch_all(&db).await.unwrap_or_default();
+
+    let leaderboard = sqlx::query_as::<_, LeaderboardEntry>(r#"SELECT u.username, u.avatar_url, COALESCE(SUM(a.distance_meters), 0)::bigint as total_meters FROM users u JOIN activities a ON u.id = a.user_id WHERE a.start_time >= date_trunc('month', now()) GROUP BY u.id ORDER BY total_meters DESC LIMIT 10"#)
+        .fetch_all(&db).await.unwrap_or_default();
+
+    let activities = sqlx::query_as::<_, ActivityFeedItem>(r#"SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.user_id = $1 ORDER BY a.start_time DESC"#)
+        .bind(user_id)
+        .fetch_all(&db).await.unwrap_or_default();
+
+    Ok(Json(Dashboard {
+        weekly_total_meters: stats.get(0),
+        monthly_total_meters: stats.get(1),
+        weekly_trend,
+        leaderboard,
+        activities
+    }))
 }
 
 async fn delete_activity(State(state): State<AppState>, Path(id): Path<i32>) -> Result<StatusCode, (StatusCode, String)> {
