@@ -357,14 +357,26 @@ async fn upload_run(State(state): State<AppState>, mut multipart: Multipart) -> 
     Ok(StatusCode::CREATED)
 }
 
-async fn get_feed(State(state): State<AppState>, Query(pagination): Query<Pagination>) -> Json<Vec<ActivityFeedItem>> {
-    let db = match state.get_db().await { Ok(d) => d, Err(_) => return Json(vec![]) };
+async fn get_feed(State(state): State<AppState>, Query(pagination): Query<Pagination>) -> Result<Json<Vec<ActivityFeedItem>>, (StatusCode, String)> {
+    let db = state.get_db().await?;
     let per_page = pagination.per_page.unwrap_or(20) as i64;
     let offset = (pagination.page.unwrap_or(1) as i64 - 1) * per_page;
+
     let activities = sqlx::query_as::<_, ActivityFeedItem>(
-        r#"SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a JOIN users u ON a.user_id = u.id ORDER BY a.start_time DESC LIMIT $1 OFFSET $2"#
-    ).bind(per_page).bind(offset).fetch_all(&db).await.unwrap_or_default();
-    Json(activities)
+        r#"SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds,
+           ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url,
+           a.avg_heart_rate, a.avg_cadence, a.total_calories,
+           (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count,
+           (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count
+           FROM activities a
+           JOIN users u ON a.user_id = u.id
+           ORDER BY a.start_time DESC LIMIT $1 OFFSET $2"#
+    ).bind(per_page).bind(offset).fetch_all(&db).await.map_err(|e| {
+        error!("Feed query failed: {:?}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    Ok(Json(activities))
 }
 
 async fn get_activity(State(state): State<AppState>, Path(id): Path<i32>) -> Result<Json<ActivityDetail>, (StatusCode, String)> {
