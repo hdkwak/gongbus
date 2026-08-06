@@ -149,16 +149,7 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string()).parse().unwrap();
-    let mut db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-
-    // Force prepared_statements=false for Supabase Pooler compatibility
-    if !db_url.contains("prepared_statements=false") {
-        if db_url.contains('?') {
-            db_url.push_str("&prepared_statements=false");
-        } else {
-            db_url.push_str("?prepared_statements=false");
-        }
-    }
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     let cloudinary_config = CloudinaryConfig {
         cloud_name: std::env::var("CLOUDINARY_CLOUD_NAME").unwrap_or_default(),
@@ -170,9 +161,6 @@ async fn main() {
     let opt = opt.disable_statement_logging()
         .statement_cache_capacity(0);
 
-    // USE SIMPLE PROTOCOL for Supabase Pooler compatibility
-    // This is the most reliable way to fix "prepared statement already exists" (code 42P05)
-    // as it prevents SQLx from using the binary protocol that requires preparation.
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .acquire_timeout(std::time::Duration::from_secs(30))
@@ -372,8 +360,13 @@ async fn get_feed(State(state): State<AppState>, Query(pagination): Query<Pagina
 
 async fn get_activity(State(state): State<AppState>, Path(id): Path<i32>) -> Result<Json<ActivityDetail>, (StatusCode, String)> {
     let db = state.get_db().await?;
-    let row = sqlx::query("SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, a.time_series_data, u.username, u.avatar_url, a.avg_heart_rate, a.max_heart_rate, a.avg_cadence, a.total_calories FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.id = $1").bind(id).fetch_optional(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?.ok_or((StatusCode::NOT_FOUND, "Not found".to_string()))?;
+    let row = sqlx::query("SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, a.time_series_data, u.username, u.avatar_url, a.avg_heart_rate, a.max_heart_rate, a.avg_cadence, a.total_calories FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.id = $1").bind(id).fetch_optional(&db).await.map_err(|e| {
+        error!("Get activity failed: {:?}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?.ok_or((StatusCode::NOT_FOUND, "Not found".to_string()))?;
+
     let comments = sqlx::query_as::<_, Comment>("SELECT u.username, u.avatar_url, c.comment_text, c.created_at FROM activity_comments c JOIN users u ON c.user_id = u.id WHERE c.activity_id = $1 ORDER BY c.created_at ASC").bind(id).fetch_all(&db).await.unwrap_or_default();
+
     Ok(Json(ActivityDetail {
         id: row.get(0),
         title: row.get(1),
