@@ -46,7 +46,7 @@ struct ActivityFeedItem {
     distance_meters: Option<i32>,
     duration_seconds: Option<i32>,
     route_line_geojson: Option<serde_json::Value>,
-    username: String,
+    username: Option<String>,
     avatar_url: Option<String>,
     avg_heart_rate: Option<i32>,
     avg_cadence: Option<i32>,
@@ -116,7 +116,7 @@ struct Dashboard {
 
 #[derive(Serialize, FromRow)]
 struct LeaderboardEntry {
-    username: String,
+    username: Option<String>,
     avatar_url: Option<String>,
     total_meters: i64,
 }
@@ -381,9 +381,24 @@ async fn get_feed(State(state): State<AppState>, Query(pagination): Query<Pagina
 
 async fn get_activity(State(state): State<AppState>, Path(id): Path<i32>) -> Result<Json<ActivityDetail>, (StatusCode, String)> {
     let db = state.get_db().await?;
-    let row = sqlx::query("SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, a.time_series_data, u.username, u.avatar_url, a.avg_heart_rate, a.max_heart_rate, a.avg_cadence, a.total_calories FROM activities a JOIN users u ON a.user_id = u.id WHERE a.id = $1").bind(id).fetch_optional(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?.ok_or((StatusCode::NOT_FOUND, "Not found".to_string()))?;
+    let row = sqlx::query("SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, a.time_series_data, u.username, u.avatar_url, a.avg_heart_rate, a.max_heart_rate, a.avg_cadence, a.total_calories FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.id = $1").bind(id).fetch_optional(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?.ok_or((StatusCode::NOT_FOUND, "Not found".to_string()))?;
     let comments = sqlx::query_as::<_, Comment>("SELECT u.username, u.avatar_url, c.comment_text, c.created_at FROM activity_comments c JOIN users u ON c.user_id = u.id WHERE c.activity_id = $1 ORDER BY c.created_at ASC").bind(id).fetch_all(&db).await.unwrap_or_default();
-    Ok(Json(ActivityDetail { id: row.get(0), title: row.get(1), start_time: row.get(2), distance_meters: row.get(3), duration_seconds: row.get(4), route_line_geojson: row.get(5), time_series_data: row.get(6), username: row.get(7), avatar_url: row.get(8), avg_heart_rate: row.get(9), max_heart_rate: row.get(10), avg_cadence: row.get(11), total_calories: row.get(12), comments }))
+    Ok(Json(ActivityDetail {
+        id: row.get(0),
+        title: row.get(1),
+        start_time: row.get(2),
+        distance_meters: row.get(3),
+        duration_seconds: row.get(4),
+        route_line_geojson: row.get(5),
+        time_series_data: row.get(6),
+        username: row.get::<Option<String>, _>(7).unwrap_or_else(|| "Unknown".to_string()),
+        avatar_url: row.get(8),
+        avg_heart_rate: row.get(9),
+        max_heart_rate: row.get(10),
+        avg_cadence: row.get(11),
+        total_calories: row.get(12),
+        comments
+    }))
 }
 
 async fn get_dashboard(State(state): State<AppState>, Path(user_id): Path<i32>) -> Json<Dashboard> {
@@ -391,7 +406,7 @@ async fn get_dashboard(State(state): State<AppState>, Path(user_id): Path<i32>) 
     let stats = sqlx::query("SELECT COALESCE(SUM(distance_meters) FILTER (WHERE start_time >= date_trunc('week', now())), 0)::bigint, COALESCE(SUM(distance_meters) FILTER (WHERE start_time >= date_trunc('month', now())), 0)::bigint FROM activities WHERE user_id = $1").bind(user_id).fetch_one(&db).await.unwrap();
     let weekly_trend = sqlx::query_as::<_, WeeklyMileage>("SELECT date_trunc('week', start_time)::date as week_start, COALESCE(SUM(distance_meters), 0)::bigint as distance_meters FROM activities WHERE user_id = $1 GROUP BY week_start ORDER BY week_start ASC LIMIT 10").bind(user_id).fetch_all(&db).await.unwrap_or_default();
     let leaderboard = sqlx::query_as::<_, LeaderboardEntry>(r#"SELECT u.username, u.avatar_url, COALESCE(SUM(a.distance_meters), 0)::bigint as total_meters FROM users u JOIN activities a ON u.id = a.user_id WHERE a.start_time >= date_trunc('month', now()) GROUP BY u.id ORDER BY total_meters DESC LIMIT 10"#).fetch_all(&db).await.unwrap_or_default();
-    let activities = sqlx::query_as::<_, ActivityFeedItem>(r#"SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a JOIN users u ON a.user_id = u.id WHERE a.user_id = $1 ORDER BY a.start_time DESC"#).bind(user_id).fetch_all(&db).await.unwrap_or_default();
+    let activities = sqlx::query_as::<_, ActivityFeedItem>(r#"SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.user_id = $1 ORDER BY a.start_time DESC"#).bind(user_id).fetch_all(&db).await.unwrap_or_default();
     Json(Dashboard { weekly_total_meters: stats.get(0), monthly_total_meters: stats.get(1), weekly_trend, leaderboard, activities })
 }
 
