@@ -39,6 +39,7 @@ struct CloudinaryConfig {
 #[derive(Serialize, Deserialize, FromRow)]
 struct ActivityFeedItem {
     id: i32,
+    user_id: i32,
     title: Option<String>,
     start_time: chrono::DateTime<chrono::Utc>,
     distance_meters: Option<i32>,
@@ -92,9 +93,10 @@ struct ActivityDetail {
 }
 
 #[derive(Deserialize)]
-struct Pagination {
+struct FeedQuery {
     page: Option<u32>,
     per_page: Option<u32>,
+    user_id: Option<i32>,
 }
 
 #[derive(Serialize, FromRow)]
@@ -114,6 +116,7 @@ struct Dashboard {
 
 #[derive(Serialize, FromRow)]
 struct LeaderboardEntry {
+    user_id: i32,
     username: Option<String>,
     avatar_url: Option<String>,
     total_meters: i64,
@@ -336,21 +339,39 @@ async fn upload_run(State(state): State<AppState>, mut multipart: Multipart) -> 
     Ok(StatusCode::CREATED)
 }
 
-async fn get_feed(State(state): State<AppState>, Query(pagination): Query<Pagination>) -> Result<Json<Vec<ActivityFeedItem>>, (StatusCode, String)> {
+async fn get_feed(State(state): State<AppState>, Query(query): Query<FeedQuery>) -> Result<Json<Vec<ActivityFeedItem>>, (StatusCode, String)> {
     let db = state.get_db().await?;
-    let per_page = pagination.per_page.unwrap_or(20) as i64;
-    let offset = (pagination.page.unwrap_or(1) as i64 - 1) * per_page;
+    let per_page = query.per_page.unwrap_or(20) as i64;
+    let offset = (query.page.unwrap_or(1) as i64 - 1) * per_page;
 
-    let activities = sqlx::query_as::<_, ActivityFeedItem>(
-        r#"SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds,
-           ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url,
-           a.avg_heart_rate, a.avg_cadence, a.total_calories,
-           (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count,
-           (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count
-           FROM activities a
-           LEFT JOIN users u ON a.user_id = u.id
-           ORDER BY a.start_time DESC LIMIT $1 OFFSET $2"#
-    ).bind(per_page).bind(offset).fetch_all(&db).await.map_err(|e| {
+    let activities = match query.user_id {
+        Some(uid) => {
+            sqlx::query_as::<_, ActivityFeedItem>(
+                r#"SELECT a.id, a.user_id, a.title, a.start_time, a.distance_meters, a.duration_seconds,
+                   ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url,
+                   a.avg_heart_rate, a.avg_cadence, a.total_calories,
+                   (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count,
+                   (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count
+                   FROM activities a
+                   LEFT JOIN users u ON a.user_id = u.id
+                   WHERE a.user_id = $1
+                   ORDER BY a.start_time DESC LIMIT $2 OFFSET $3"#
+            ).bind(uid).bind(per_page).bind(offset).fetch_all(&db).await
+        },
+        None => {
+            sqlx::query_as::<_, ActivityFeedItem>(
+                r#"SELECT a.id, a.user_id, a.title, a.start_time, a.distance_meters, a.duration_seconds,
+                   ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url,
+                   a.avg_heart_rate, a.avg_cadence, a.total_calories,
+                   (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count,
+                   (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count
+                   FROM activities a
+                   LEFT JOIN users u ON a.user_id = u.id
+                   ORDER BY a.start_time DESC LIMIT $1 OFFSET $2"#
+            ).bind(per_page).bind(offset).fetch_all(&db).await
+        }
+    }
+map_err(|e| {
         error!("Feed query failed: {:?}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
@@ -396,7 +417,7 @@ async fn get_dashboard(State(state): State<AppState>, Path(user_id): Path<i32>) 
         .bind(user_id)
         .fetch_all(&db).await.unwrap_or_default();
 
-    let leaderboard = sqlx::query_as::<_, LeaderboardEntry>(r#"SELECT u.username, u.avatar_url, COALESCE(SUM(a.distance_meters), 0)::bigint as total_meters FROM users u JOIN activities a ON u.id = a.user_id WHERE a.start_time >= date_trunc('month', now()) GROUP BY u.id ORDER BY total_meters DESC LIMIT 10"#)
+    let leaderboard = sqlx::query_as::<_, LeaderboardEntry>(r#"SELECT u.id as user_id, u.username, u.avatar_url, COALESCE(SUM(a.distance_meters), 0)::bigint as total_meters FROM users u JOIN activities a ON u.id = a.user_id WHERE a.start_time >= date_trunc('month', now()) GROUP BY u.id ORDER BY total_meters DESC LIMIT 10"#)
         .fetch_all(&db).await.unwrap_or_default();
 
     let activities = sqlx::query_as::<_, ActivityFeedItem>(r#"SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.user_id = $1 ORDER BY a.start_time DESC"#)
