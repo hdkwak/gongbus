@@ -175,10 +175,10 @@ async fn main() {
 
     let app = Router::new()
         .route("/feed", get(get_feed))
-        .route("/activities/:id", get(get_activity).delete(delete_activity))
+        .route("/activities/:id", get(get_activity).put(update_activity).delete(delete_activity))
         .route("/activities/:id/like", post(like_activity))
         .route("/activities/:id/comment", post(comment_activity))
-        .route("/users", post(create_user))
+        .route("/users", get(get_users).post(create_user))
         .route("/users/:id/dashboard", get(get_dashboard))
         .route("/users/:id", get(get_user_profile).put(update_user_profile))
         .route("/upload-run", post(upload_run))
@@ -202,6 +202,13 @@ async fn create_user(State(state): State<AppState>, Json(payload): Json<UserProf
 
     let id: i32 = row.get(0);
     Ok(Json(UserProfile { id, ..payload }))
+}
+
+async fn get_users(State(state): State<AppState>) -> Result<Json<Vec<UserProfile>>, (StatusCode, String)> {
+    let db = state.get_db().await?;
+    let users = sqlx::query_as::<_, UserProfile>("SELECT id, username, avatar_url, marathon_goal_sec, weekly_target_km, monthly_target_km, target_lsd_count, target_race, race_date FROM users ORDER BY id DESC")
+        .fetch_all(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(users))
 }
 
 async fn get_user_profile(State(state): State<AppState>, Path(id): Path<i32>) -> Result<Json<UserProfile>, (StatusCode, String)> {
@@ -247,6 +254,8 @@ async fn upload_run(State(state): State<AppState>, mut multipart: Multipart) -> 
     let db = state.get_db().await?;
     let mut data = Vec::new();
     let mut user_id = 1;
+    let mut title = None;
+
     while let Some(mut field) = multipart.next_field().await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))? {
         if field.name() == Some("file") {
             while let Some(chunk) = field.next().await {
@@ -255,6 +264,11 @@ async fn upload_run(State(state): State<AppState>, mut multipart: Multipart) -> 
             }
         } else if field.name() == Some("user_id") {
             user_id = field.text().await.unwrap_or_default().parse().unwrap_or(1);
+        } else if field.name() == Some("title") {
+            let t = field.text().await.unwrap_or_default();
+            if !t.is_empty() {
+                title = Some(t);
+            }
         }
     }
     let mut reader = Cursor::new(data);
@@ -333,8 +347,11 @@ async fn upload_run(State(state): State<AppState>, mut multipart: Multipart) -> 
     let wkt = format!("LINESTRING({})", coordinates.join(","));
     let ts_final: Vec<MetricRecord> = time_series_with_meta.into_iter().map(|(r, _)| r).collect();
     let ts_json = serde_json::to_value(ts_final).unwrap_or(serde_json::Value::Null);
+
+    let final_title = title.unwrap_or_else(|| "Morning Run".to_string());
+
     sqlx::query("INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, avg_cadence, total_calories) VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10, $11) ON CONFLICT (user_id, start_time) DO UPDATE SET title=EXCLUDED.title, distance_meters=EXCLUDED.distance_meters, duration_seconds=EXCLUDED.duration_seconds, route_line=EXCLUDED.route_line, time_series_data=EXCLUDED.time_series_data, avg_heart_rate=EXCLUDED.avg_heart_rate, max_heart_rate=EXCLUDED.max_heart_rate, avg_cadence=EXCLUDED.avg_cadence, total_calories=EXCLUDED.total_calories")
-        .bind(user_id).bind("Morning Run").bind(start_time).bind(final_distance as i32).bind(final_duration).bind(wkt).bind(ts_json).bind(avg_hr).bind(max_hr).bind(avg_cad).bind(calories)
+        .bind(user_id).bind(final_title).bind(start_time).bind(final_distance as i32).bind(final_duration).bind(wkt).bind(ts_json).bind(avg_hr).bind(max_hr).bind(avg_cad).bind(calories)
         .execute(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::CREATED)
 }
@@ -451,4 +468,15 @@ async fn comment_activity(State(state): State<AppState>, Path(id): Path<i32>, Js
     let db = state.get_db().await?;
     sqlx::query("INSERT INTO activity_comments (activity_id, user_id, comment_text) VALUES ($1, $2, $3)").bind(id).bind(payload.user_id).bind(payload.comment_text).execute(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::CREATED)
+}
+
+async fn update_activity(State(state): State<AppState>, Path(id): Path<i32>, Json(payload): Json<std::collections::HashMap<String, Option<String>>>) -> Result<StatusCode, (StatusCode, String)> {
+    let db = state.get_db().await?;
+    if let Some(Some(title)) = payload.get("title") {
+        sqlx::query("UPDATE activities SET title = $1 WHERE id = $2")
+            .bind(title)
+            .bind(id)
+            .execute(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    Ok(StatusCode::OK)
 }
