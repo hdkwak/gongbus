@@ -260,10 +260,49 @@ async fn get_strava_link(State(state): State<AppState>, Path(id): Path<i32>) -> 
     Ok(Json(serde_json::json!({ "url": url })))
 }
 
+async fn fetch_strava_time_series(activity_id: i64, access_token: &str, start_time: chrono::DateTime<chrono::Utc>) -> Option<serde_json::Value> {
+    let client = reqwest::Client::new();
+    let url = format!("https://www.strava.com/api/v3/activities/{}/streams", activity_id);
+    let response = client.get(url)
+        .query(&[("keys", "time,distance,altitude,heartrate,cadence,velocity_smooth"), ("key_by_type", "true")])
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .ok()?;
+
+    if !response.status().is_success() { return None; }
+
+    let streams: serde_json::Value = response.json().await.ok()?;
+
+    let times = streams.get("time").and_then(|s| s.get("data")).and_then(|d| d.as_array())?;
+    let distances = streams.get("distance").and_then(|s| s.get("data")).and_then(|d| d.as_array());
+    let altitudes = streams.get("altitude").and_then(|s| s.get("data")).and_then(|d| d.as_array());
+    let heartrates = streams.get("heartrate").and_then(|s| s.get("data")).and_then(|d| d.as_array());
+    let cadences = streams.get("cadence").and_then(|s| s.get("data")).and_then(|d| d.as_array());
+    let velocities = streams.get("velocity_smooth").and_then(|s| s.get("data")).and_then(|d| d.as_array());
+
+    let mut records = Vec::new();
+    for i in 0..times.len() {
+        let offset_sec = times[i].as_i64().unwrap_or(0);
+        let record = MetricRecord {
+            timestamp: Some(start_time + chrono::Duration::seconds(offset_sec)),
+            heart_rate: heartrates.and_then(|s| s.get(i)).and_then(|v| v.as_u64()).map(|v| v as u16),
+            cadence: cadences.and_then(|s| s.get(i)).and_then(|v| v.as_u64()).map(|v| v as u16),
+            altitude: altitudes.and_then(|s| s.get(i)).and_then(|v| v.as_f64()),
+            speed: velocities.and_then(|s| s.get(i)).and_then(|v| v.as_f64()),
+            distance: distances.and_then(|s| s.get(i)).and_then(|v| v.as_f64()),
+            ground_contact_time: None,
+            stride_distance: None,
+        };
+        records.push(record);
+    }
+
+    serde_json::to_value(records).ok()
+}
+
 async fn trigger_strava_sync(State(state): State<AppState>, Path(user_id): Path<i32>) -> Result<StatusCode, (StatusCode, String)> {
     let db = state.get_db().await?;
 
-    // Get valid access token
     let access_token = get_strava_access_token(&db, &state.strava_config, user_id).await.map_err(|e| {
         error!("Failed to get Strava access token for user {}: {:?}", user_id, e);
         e
@@ -272,57 +311,47 @@ async fn trigger_strava_sync(State(state): State<AppState>, Path(user_id): Path<
     info!("Starting manual Strava sync for user {}", user_id);
     let client = reqwest::Client::new();
     let response = client.get("https://www.strava.com/api/v3/athlete/activities")
-        .query(&[("per_page", "10")])
-        .bearer_auth(access_token)
+        .query(&[("per_page", "5")])
+        .bearer_auth(&access_token)
         .send()
         .await
-        .map_err(|e| {
-            error!("Strava API request failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    if !response.status().is_success() {
-        let status_code = response.status().as_u16();
-        let err_body = response.text().await.unwrap_or_default();
-        error!("Strava API returned error: {} - {}", status_code, err_body);
-        let axum_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        return Err((axum_status, err_body));
-    }
+    let activities: Vec<serde_json::Value> = response.json().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let activities: Vec<serde_json::Value> = response.json().await.map_err(|e| {
-        error!("Failed to parse Strava activities JSON: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
-
-    info!("Found {} activities to sync from Strava", activities.len());
     for act in activities {
-        let title = act.get("name").and_then(|v| v.as_str()).unwrap_or("Strava Run").to_string();
-        let start_time_str = act.get("start_date").and_then(|v| v.as_str()).unwrap_or_default();
-        let start_time = chrono::DateTime::parse_from_rfc3339(start_time_str).map(|dt| dt.with_timezone(&chrono::Utc)).unwrap_or_else(|_| chrono::Utc::now());
-        let distance = act.get("distance").and_then(|v| v.as_f64()).unwrap_or(0.0) as i32;
-        let duration = act.get("moving_time").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-        let avg_hr = act.get("average_heartrate").and_then(|v| v.as_f64()).map(|v| v as i32);
-        let max_hr = act.get("max_heartrate").and_then(|v| v.as_f64()).map(|v| v as i32);
-        let calories = act.get("calories").and_then(|v| v.as_f64()).map(|v| v as i32);
+        if let Some(activity_id) = act.get("id").and_then(|v| v.as_i64()) {
+            let title = act.get("name").and_then(|v| v.as_str()).unwrap_or("Strava Run").to_string();
+            let start_time_str = act.get("start_date").and_then(|v| v.as_str()).unwrap_or_default();
+            let start_time = chrono::DateTime::parse_from_rfc3339(start_time_str).map(|dt| dt.with_timezone(&chrono::Utc)).unwrap_or_else(|_| chrono::Utc::now());
+            let distance = act.get("distance").and_then(|v| v.as_f64()).unwrap_or(0.0) as i32;
+            let duration = act.get("moving_time").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let avg_hr = act.get("average_heartrate").and_then(|v| v.as_f64()).map(|v| v as i32);
+            let max_hr = act.get("max_heartrate").and_then(|v| v.as_f64()).map(|v| v as i32);
+            let calories = act.get("calories").and_then(|v| v.as_f64()).map(|v| v as i32);
 
-        let route_wkt = if let Some(polyline_str) = act.get("map").and_then(|m| m.get("summary_polyline")).and_then(|v| v.as_str()) {
-            if let Ok(coords) = polyline::decode_polyline(polyline_str, 5) {
-                let points: Vec<String> = coords.into_iter().map(|p| format!("{} {}", p.x, p.y)).collect();
-                if points.len() >= 2 {
-                    Some(format!("LINESTRING({})", points.join(",")))
+            let route_wkt = if let Some(polyline_str) = act.get("map").and_then(|m| m.get("summary_polyline")).and_then(|v| v.as_str()) {
+                if let Ok(coords) = polyline::decode_polyline(polyline_str, 5) {
+                    let points: Vec<String> = coords.into_iter().map(|p| format!("{} {}", p.x, p.y)).collect();
+                    if points.len() >= 2 {
+                        Some(format!("LINESTRING({})", points.join(",")))
+                    } else { None }
                 } else { None }
-            } else { None }
-        } else { None };
+            } else { None };
 
-        sqlx::query(
-            "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, avg_heart_rate, max_heart_rate, total_calories)
-             VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9)
-             ON CONFLICT (user_id, start_time) DO UPDATE SET
-             title=EXCLUDED.title, distance_meters=EXCLUDED.distance_meters, duration_seconds=EXCLUDED.duration_seconds,
-             route_line=EXCLUDED.route_line, avg_heart_rate=EXCLUDED.avg_heart_rate, max_heart_rate=EXCLUDED.max_heart_rate, total_calories=EXCLUDED.total_calories"
-        )
-        .bind(user_id).bind(title).bind(start_time).bind(distance).bind(duration).bind(route_wkt).bind(avg_hr).bind(max_hr).bind(calories)
-        .execute(&db).await.ok();
+            // Fetch detailed streams for charts
+            let ts_data = fetch_strava_time_series(activity_id, &access_token, start_time).await;
+
+            sqlx::query(
+                "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, total_calories)
+                 VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10)
+                 ON CONFLICT (user_id, start_time) DO UPDATE SET
+                 title=EXCLUDED.title, distance_meters=EXCLUDED.distance_meters, duration_seconds=EXCLUDED.duration_seconds,
+                 route_line=EXCLUDED.route_line, time_series_data=EXCLUDED.time_series_data, avg_heart_rate=EXCLUDED.avg_heart_rate, max_heart_rate=EXCLUDED.max_heart_rate, total_calories=EXCLUDED.total_calories"
+            )
+            .bind(user_id).bind(title).bind(start_time).bind(distance).bind(duration).bind(route_wkt).bind(ts_data).bind(avg_hr).bind(max_hr).bind(calories)
+            .execute(&db).await.ok();
+        }
     }
 
     Ok(StatusCode::OK)
@@ -503,14 +532,17 @@ async fn handle_strava_webhook(State(state): State<AppState>, Json(payload): Jso
                             } else { None }
                         } else { None };
 
+                        // Fetch detailed streams for charts
+                        let ts_data = fetch_strava_time_series(activity_id, &access_token, start_time).await;
+
                         sqlx::query(
-                            "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, avg_heart_rate, max_heart_rate, total_calories)
-                             VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9)
+                            "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, total_calories)
+                             VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10)
                              ON CONFLICT (user_id, start_time) DO UPDATE SET
                              title=EXCLUDED.title, distance_meters=EXCLUDED.distance_meters, duration_seconds=EXCLUDED.duration_seconds,
-                             route_line=EXCLUDED.route_line, avg_heart_rate=EXCLUDED.avg_heart_rate, max_heart_rate=EXCLUDED.max_heart_rate, total_calories=EXCLUDED.total_calories"
+                             route_line=EXCLUDED.route_line, time_series_data=EXCLUDED.time_series_data, avg_heart_rate=EXCLUDED.avg_heart_rate, max_heart_rate=EXCLUDED.max_heart_rate, total_calories=EXCLUDED.total_calories"
                         )
-                        .bind(user_id).bind(title).bind(start_time).bind(distance).bind(duration).bind(route_wkt).bind(avg_hr).bind(max_hr).bind(calories)
+                        .bind(user_id).bind(title).bind(start_time).bind(distance).bind(duration).bind(route_wkt).bind(ts_data).bind(avg_hr).bind(max_hr).bind(calories)
                         .execute(&db).await.ok();
                     }
                 }
