@@ -311,7 +311,7 @@ async fn trigger_strava_sync(State(state): State<AppState>, Path(user_id): Path<
     info!("Starting manual Strava sync for user {}", user_id);
     let client = reqwest::Client::new();
     let response = client.get("https://www.strava.com/api/v3/athlete/activities")
-        .query(&[("per_page", "5")])
+        .query(&[("per_page", "30")])
         .bearer_auth(&access_token)
         .send()
         .await
