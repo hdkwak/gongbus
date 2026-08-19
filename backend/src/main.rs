@@ -328,6 +328,7 @@ async fn trigger_strava_sync(State(state): State<AppState>, Path(user_id): Path<
             let duration = act.get("moving_time").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             let avg_hr = act.get("average_heartrate").and_then(|v| v.as_f64()).map(|v| v as i32);
             let max_hr = act.get("max_heartrate").and_then(|v| v.as_f64()).map(|v| v as i32);
+            let avg_cad = act.get("average_cadence").and_then(|v| v.as_f64()).map(|v| (v * 2.0) as i32);
             let calories = act.get("calories").and_then(|v| v.as_f64()).map(|v| v as i32);
 
             let route_wkt = if let Some(polyline_str) = act.get("map").and_then(|m| m.get("summary_polyline")).and_then(|v| v.as_str()) {
@@ -343,13 +344,14 @@ async fn trigger_strava_sync(State(state): State<AppState>, Path(user_id): Path<
             let ts_data = fetch_strava_time_series(activity_id, &access_token, start_time).await;
 
             sqlx::query(
-                "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, total_calories)
-                 VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10)
+                "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, avg_cadence, total_calories)
+                 VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10, $11)
                  ON CONFLICT (user_id, start_time) DO UPDATE SET
                  title=EXCLUDED.title, distance_meters=EXCLUDED.distance_meters, duration_seconds=EXCLUDED.duration_seconds,
-                 route_line=EXCLUDED.route_line, time_series_data=EXCLUDED.time_series_data, avg_heart_rate=EXCLUDED.avg_heart_rate, max_heart_rate=EXCLUDED.max_heart_rate, total_calories=EXCLUDED.total_calories"
+                 route_line=EXCLUDED.route_line, time_series_data=EXCLUDED.time_series_data, avg_heart_rate=EXCLUDED.avg_heart_rate,
+                 max_heart_rate=EXCLUDED.max_heart_rate, avg_cadence=EXCLUDED.avg_cadence, total_calories=EXCLUDED.total_calories"
             )
-            .bind(user_id).bind(title).bind(start_time).bind(distance).bind(duration).bind(route_wkt).bind(ts_data).bind(avg_hr).bind(max_hr).bind(calories)
+            .bind(user_id).bind(title).bind(start_time).bind(distance).bind(duration).bind(route_wkt).bind(ts_data).bind(avg_hr).bind(max_hr).bind(avg_cad).bind(calories)
             .execute(&db).await.ok();
         }
     }
@@ -520,6 +522,7 @@ async fn handle_strava_webhook(State(state): State<AppState>, Json(payload): Jso
                         let duration = act.get("moving_time").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                         let avg_hr = act.get("average_heartrate").and_then(|v| v.as_f64()).map(|v| v as i32);
                         let max_hr = act.get("max_heartrate").and_then(|v| v.as_f64()).map(|v| v as i32);
+                        let avg_cad = act.get("average_cadence").and_then(|v| v.as_f64()).map(|v| (v * 2.0) as i32);
                         let calories = act.get("calories").and_then(|v| v.as_f64()).map(|v| v as i32);
 
                         // Strava polyline
@@ -536,13 +539,14 @@ async fn handle_strava_webhook(State(state): State<AppState>, Json(payload): Jso
                         let ts_data = fetch_strava_time_series(activity_id, &access_token, start_time).await;
 
                         sqlx::query(
-                            "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, total_calories)
-                             VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10)
+                            "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, avg_cadence, total_calories)
+                             VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10, $11)
                              ON CONFLICT (user_id, start_time) DO UPDATE SET
                              title=EXCLUDED.title, distance_meters=EXCLUDED.distance_meters, duration_seconds=EXCLUDED.duration_seconds,
-                             route_line=EXCLUDED.route_line, time_series_data=EXCLUDED.time_series_data, avg_heart_rate=EXCLUDED.avg_heart_rate, max_heart_rate=EXCLUDED.max_heart_rate, total_calories=EXCLUDED.total_calories"
+                             route_line=EXCLUDED.route_line, time_series_data=EXCLUDED.time_series_data, avg_heart_rate=EXCLUDED.avg_heart_rate,
+                             max_heart_rate=EXCLUDED.max_heart_rate, avg_cadence=EXCLUDED.avg_cadence, total_calories=EXCLUDED.total_calories"
                         )
-                        .bind(user_id).bind(title).bind(start_time).bind(distance).bind(duration).bind(route_wkt).bind(ts_data).bind(avg_hr).bind(max_hr).bind(calories)
+                        .bind(user_id).bind(title).bind(start_time).bind(distance).bind(duration).bind(route_wkt).bind(ts_data).bind(avg_hr).bind(max_hr).bind(avg_cad).bind(calories)
                         .execute(&db).await.ok();
                     }
                 }
