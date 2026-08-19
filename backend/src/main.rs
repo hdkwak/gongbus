@@ -11,7 +11,7 @@ use sqlx::{FromRow, Row, ConnectOptions};
 use std::io::Cursor;
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
-use tracing::{info, error};
+use tracing::{info, error, warn};
 use futures_util::StreamExt;
 use reqwest::multipart as req_multipart;
 use sha1::{Sha1, Digest};
@@ -342,6 +342,11 @@ async fn trigger_strava_sync(State(state): State<AppState>, Path(user_id): Path<
 
             // Fetch detailed streams for charts
             let ts_data = fetch_strava_time_series(activity_id, &access_token, start_time).await;
+            if ts_data.is_some() {
+                info!("Fetched streams for activity {}", activity_id);
+            } else {
+                warn!("No streams found for activity {}", activity_id);
+            }
 
             sqlx::query(
                 "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, avg_cadence, total_calories)
@@ -509,7 +514,7 @@ async fn handle_strava_webhook(State(state): State<AppState>, Json(payload): Jso
                 // Pull activity details from Strava
                 let client = reqwest::Client::new();
                 let response = client.get(format!("https://www.strava.com/api/v3/activities/{}", activity_id))
-                    .bearer_auth(access_token)
+                    .bearer_auth(&access_token)
                     .send()
                     .await;
 
