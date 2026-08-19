@@ -311,7 +311,7 @@ async fn trigger_strava_sync(State(state): State<AppState>, Path(user_id): Path<
     info!("Starting manual Strava sync for user {}", user_id);
     let client = reqwest::Client::new();
     let response = client.get("https://www.strava.com/api/v3/athlete/activities")
-        .query(&[("per_page", "30")])
+        .query(&[("per_page", "20")])
         .bearer_auth(&access_token)
         .send()
         .await
@@ -319,11 +319,23 @@ async fn trigger_strava_sync(State(state): State<AppState>, Path(user_id): Path<
 
     let activities: Vec<serde_json::Value> = response.json().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    info!("Found {} activities in Strava list. checking for new data...", activities.len());
     for act in activities {
         if let Some(activity_id) = act.get("id").and_then(|v| v.as_i64()) {
-            let title = act.get("name").and_then(|v| v.as_str()).unwrap_or("Strava Run").to_string();
             let start_time_str = act.get("start_date").and_then(|v| v.as_str()).unwrap_or_default();
             let start_time = chrono::DateTime::parse_from_rfc3339(start_time_str).map(|dt| dt.with_timezone(&chrono::Utc)).unwrap_or_else(|_| chrono::Utc::now());
+
+            // OPTIMIZATION: Check if we already have detailed time_series_data for this activity
+            let existing = sqlx::query("SELECT id FROM activities WHERE user_id = $1 AND start_time = $2 AND time_series_data IS NOT NULL")
+                .bind(user_id).bind(start_time)
+                .fetch_optional(&db).await.ok().flatten();
+
+            if existing.is_some() {
+                info!("Skipping stream fetch for activity {} (already synced with high-res data)", activity_id);
+                continue;
+            }
+
+            let title = act.get("name").and_then(|v| v.as_str()).unwrap_or("Strava Run").to_string();
             let distance = act.get("distance").and_then(|v| v.as_f64()).unwrap_or(0.0) as i32;
             let duration = act.get("moving_time").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             let avg_hr = act.get("average_heartrate").and_then(|v| v.as_f64()).map(|v| v as i32);
@@ -342,11 +354,6 @@ async fn trigger_strava_sync(State(state): State<AppState>, Path(user_id): Path<
 
             // Fetch detailed streams for charts
             let ts_data = fetch_strava_time_series(activity_id, &access_token, start_time).await;
-            if ts_data.is_some() {
-                info!("Fetched streams for activity {}", activity_id);
-            } else {
-                warn!("No streams found for activity {}", activity_id);
-            }
 
             sqlx::query(
                 "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, avg_cadence, total_calories)
