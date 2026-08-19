@@ -282,9 +282,11 @@ async fn trigger_strava_sync(State(state): State<AppState>, Path(user_id): Path<
         })?;
 
     if !response.status().is_success() {
+        let status_code = response.status().as_u16();
         let err_body = response.text().await.unwrap_or_default();
-        error!("Strava API returned error: {} - {}", response.status(), err_body);
-        return Err((response.status(), err_body));
+        error!("Strava API returned error: {} - {}", status_code, err_body);
+        let axum_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err((axum_status, err_body));
     }
 
     let activities: Vec<serde_json::Value> = response.json().await.map_err(|e| {
