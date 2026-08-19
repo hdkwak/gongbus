@@ -1,7 +1,6 @@
 use axum::{
     extract::{Multipart, Path, Query, State, DefaultBodyLimit},
     http::StatusCode,
-    response::Html,
     routing::{get, post},
     Json, Router,
 };
@@ -16,7 +15,6 @@ use tracing::{info, error};
 use futures_util::StreamExt;
 use reqwest::multipart as req_multipart;
 use sha1::{Sha1, Digest};
-use tokio::net::TcpListener;
 
 #[derive(Clone)]
 struct AppState {
@@ -229,14 +227,14 @@ async fn create_user(State(state): State<AppState>, Json(payload): Json<UserProf
 
 async fn get_users(State(state): State<AppState>) -> Result<Json<Vec<UserProfile>>, (StatusCode, String)> {
     let db = state.get_db().await?;
-    let users = sqlx::query_as::<_, UserProfile>("SELECT id, username, avatar_url, marathon_goal_sec, weekly_target_km, monthly_target_km, target_lsd_count, target_race, race_date FROM users ORDER BY id DESC")
+    let users = sqlx::query_as::<_, UserProfile>("SELECT id, username, avatar_url, marathon_goal_sec, weekly_target_km, monthly_target_km, target_lsd_count, target_race, race_date, strava_athlete_id FROM users ORDER BY id DESC")
         .fetch_all(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(users))
 }
 
 async fn get_user_profile(State(state): State<AppState>, Path(id): Path<i32>) -> Result<Json<UserProfile>, (StatusCode, String)> {
     let db = state.get_db().await?;
-    let user = sqlx::query_as::<_, UserProfile>("SELECT id, username, avatar_url, marathon_goal_sec, weekly_target_km, monthly_target_km, target_lsd_count, target_race, race_date FROM users WHERE id = $1")
+    let user = sqlx::query_as::<_, UserProfile>("SELECT id, username, avatar_url, marathon_goal_sec, weekly_target_km, monthly_target_km, target_lsd_count, target_race, race_date, strava_athlete_id FROM users WHERE id = $1")
         .bind(id)
         .fetch_optional(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "User not found".to_string()))?;
@@ -594,7 +592,7 @@ async fn get_feed(State(state): State<AppState>, Query(query): Query<FeedQuery>)
 
 async fn get_activity(State(state): State<AppState>, Path(id): Path<i32>) -> Result<Json<ActivityDetail>, (StatusCode, String)> {
     let db = state.get_db().await?;
-    let row = sqlx::query("SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, a.time_series_data, u.username, u.avatar_url, a.avg_heart_rate, a.max_heart_rate, a.avg_cadence, a.total_calories FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.id = $1").bind(id).fetch_optional(&db).await.map_err(|e| {
+    let row = sqlx::query("SELECT a.id, a.user_id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, a.time_series_data, u.username, u.avatar_url, a.avg_heart_rate, a.max_heart_rate, a.avg_cadence, a.total_calories FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.id = $1").bind(id).fetch_optional(&db).await.map_err(|e| {
         error!("Get activity failed: {:?}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?.ok_or((StatusCode::NOT_FOUND, "Not found".to_string()))?;
@@ -603,18 +601,19 @@ async fn get_activity(State(state): State<AppState>, Path(id): Path<i32>) -> Res
 
     Ok(Json(ActivityDetail {
         id: row.get(0),
-        title: row.get(1),
-        start_time: row.get(2),
-        distance_meters: row.get(3),
-        duration_seconds: row.get(4),
-        route_line_geojson: row.get(5),
-        time_series_data: row.get(6),
-        username: row.get::<Option<String>, _>(7).unwrap_or_else(|| "Unknown".to_string()),
-        avatar_url: row.get(8),
-        avg_heart_rate: row.get(9),
-        max_heart_rate: row.get(10),
-        avg_cadence: row.get(11),
-        total_calories: row.get(12),
+        user_id: row.get(1),
+        title: row.get(2),
+        start_time: row.get(3),
+        distance_meters: row.get(4),
+        duration_seconds: row.get(5),
+        route_line_geojson: row.get(6),
+        time_series_data: row.get(7),
+        username: row.get::<Option<String>, _>(8).unwrap_or_else(|| "Unknown".to_string()),
+        avatar_url: row.get(9),
+        avg_heart_rate: row.get(10),
+        max_heart_rate: row.get(11),
+        avg_cadence: row.get(12),
+        total_calories: row.get(13),
         comments
     }))
 }
@@ -633,7 +632,7 @@ async fn get_dashboard(State(state): State<AppState>, Path(user_id): Path<i32>) 
     let leaderboard = sqlx::query_as::<_, LeaderboardEntry>(r#"SELECT u.id as user_id, u.username, u.avatar_url, COALESCE(SUM(a.distance_meters), 0)::bigint as total_meters FROM users u JOIN activities a ON u.id = a.user_id WHERE a.start_time >= date_trunc('month', now()) GROUP BY u.id ORDER BY total_meters DESC LIMIT 10"#)
         .fetch_all(&db).await.unwrap_or_default();
 
-    let activities = sqlx::query_as::<_, ActivityFeedItem>(r#"SELECT a.id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.user_id = $1 ORDER BY a.start_time DESC"#)
+    let activities = sqlx::query_as::<_, ActivityFeedItem>(r#"SELECT a.id, a.user_id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.user_id = $1 ORDER BY a.start_time DESC"#)
         .bind(user_id)
         .fetch_all(&db).await.unwrap_or_default();
 
