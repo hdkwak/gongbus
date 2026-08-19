@@ -15,7 +15,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.health.connect.client.HealthConnectClient
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -193,6 +192,9 @@ interface RunningApi {
     @POST("users/{id}/strava-link")
     suspend fun getStravaLinkUrl(@Path("id") id: Int): StravaLinkResponse
 
+    @POST("users/{id}/strava-sync")
+    suspend fun syncStrava(@Path("id") id: Int): retrofit2.Response<Unit>
+
     @GET("users/{id}")
     suspend fun getUserProfile(@Path("id") id: Int): UserProfile
 
@@ -248,7 +250,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val db = AppDatabase.getDatabase(application)
     private val activityDao = db.activityDao()
     private val gson = Gson()
-    val healthConnectManager = HealthConnectManager(application)
 
     var activities by mutableStateOf<List<ActivityFeedItem>>(emptyList())
     var members by mutableStateOf<List<UserProfile>>(emptyList())
@@ -444,6 +445,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun syncFromStrava() {
+        val userId = userProfile?.id ?: return
+        viewModelScope.launch {
+            isUploading = true
+            try {
+                val response = api.syncStrava(userId)
+                if (response.isSuccessful) {
+                    uploadStatus.value = "Strava sync successful"
+                    fetchFeed()
+                } else {
+                    uploadStatus.value = "Strava sync failed: ${response.code()}"
+                }
+            } catch (e: Exception) {
+                uploadStatus.value = "Strava sync error: ${e.message}"
+            } finally {
+                isUploading = false
+            }
+        }
+    }
+
     fun deleteActivity(id: Int) {
         viewModelScope.launch {
             try {
@@ -531,57 +552,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } catch (e: Exception) { 
                 uploadStatus.value = "Error: ${e.message}"
             } finally { isDetailLoading = false }
-        }
-    }
-
-    fun syncFromHealthConnect(onPermissionRequired: () -> Unit = {}) {
-        viewModelScope.launch {
-            isUploading = true
-            try {
-                val userId = userProfile?.id ?: prefs.getInt("user_id", -1)
-                if (userId == -1) {
-                    uploadStatus.value = "Profile not found"
-                    return@launch
-                }
-
-                // Check if we have at least session permission
-                if (!healthConnectManager.hasAnyPermissions()) {
-                    onPermissionRequired()
-                    isUploading = false
-                    return@launch
-                }
-
-                val sessions = healthConnectManager.fetchRecentActivities()
-                if (sessions.isEmpty()) {
-                    uploadStatus.value = "No recent runs found in Health Connect"
-                    return@launch
-                }
-
-                var syncCount = 0
-                for (session in sessions) {
-                    try {
-                        val detail = healthConnectManager.getSessionDetails(session)
-                        val response = api.syncActivity(detail.copy(
-                            user_id = userId,
-                            username = userProfile?.username ?: ""
-                        ))
-                        if (response.isSuccessful) syncCount++
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
-                uploadStatus.value = if (syncCount > 0) "Synced $syncCount activities" else "All activities already synced"
-                fetchFeed()
-            } catch (e: Exception) {
-                if (e.message?.contains("permission", ignoreCase = true) == true || e is SecurityException) {
-                    onPermissionRequired()
-                } else {
-                    uploadStatus.value = "Sync failed: ${e.message}"
-                }
-                e.printStackTrace()
-            } finally {
-                isUploading = false
-            }
         }
     }
 
@@ -737,61 +707,9 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
 fun FeedScreen(viewModel: MainViewModel, onActivityClick: (Int) -> Unit, onDeleteClick: (Int) -> Unit) {
     val context = LocalContext.current
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> uri?.let { viewModel.uploadFitFile(context, it) } }
-    var missingPermissions by remember { mutableStateOf<Set<String>>(emptySet()) }
-    var showHealthPermissionDialog by remember { mutableStateOf(false) }
-    
-    val healthConnectPermissionLauncher = rememberLauncherForActivityResult(viewModel.healthConnectManager.requestPermissionsContract()) { granted ->
-        viewModel.viewModelScope.launch {
-            val missing = viewModel.healthConnectManager.getMissingPermissions()
-            if (missing.isEmpty()) {
-                viewModel.syncFromHealthConnect()
-            } else {
-                missingPermissions = missing
-                showHealthPermissionDialog = true
-            }
-        }
-    }
 
     var activityForComments by remember { mutableStateOf<Int?>(null) }
     var activityForTitleEdit by remember { mutableStateOf<ActivityFeedItem?>(null) }
-
-    if (showHealthPermissionDialog) {
-        AlertDialog(
-            onDismissRequest = { showHealthPermissionDialog = false },
-            title = { Text("Health Connect Permission") },
-            text = {
-                Column {
-                    Text("Gongbus needs permission to read your activity data from Health Connect.")
-                    if (missingPermissions.isNotEmpty()) {
-                        Spacer(Modifier.height(8.dp))
-                        Text("Missing: ${missingPermissions.joinToString(", ").replace("android.permission.health.READ_", "")}", style = MaterialTheme.typography.bodySmall, color = Color.Red)
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text("Please enable all permissions (Exercise Sessions, Heart Rate, etc.) in the Gongbus settings inside the Health Connect app.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
-                }
-            },
-            confirmButton = {
-                Row {
-                    TextButton(onClick = {
-                        showHealthPermissionDialog = false
-                        viewModel.syncFromHealthConnect()
-                    }) { Text("Proceed Anyway") }
-                    Spacer(Modifier.width(8.dp))
-                    Button(onClick = {
-                        showHealthPermissionDialog = false
-                        try {
-                            context.startActivity(viewModel.healthConnectManager.getSettingsIntent())
-                        } catch (e: Exception) {
-                            viewModel.uploadStatus.value = "Settings could not be opened"
-                        }
-                    }) { Text("Open Settings") }
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showHealthPermissionDialog = false }) { Text("Cancel") }
-            }
-        )
-    }
 
     if (activityForTitleEdit != null) {
         var newTitle by remember { mutableStateOf(activityForTitleEdit?.title ?: "") }
@@ -905,42 +823,11 @@ fun FeedScreen(viewModel: MainViewModel, onActivityClick: (Int) -> Unit, onDelet
                         
                         Spacer(Modifier.weight(1f))
                         
-                        val healthStatus = viewModel.healthConnectManager.isAvailable()
-                        if (healthStatus == HealthConnectManager.SDK_AVAILABLE) {
+                        if (viewModel.userProfile?.strava_athlete_id != null) {
                             IconButton(onClick = {
-                                viewModel.viewModelScope.launch {
-                                    val granted = viewModel.healthConnectManager.hasAnyPermissions()
-                                    if (granted) {
-                                        // We have at least something, try to sync
-                                        viewModel.syncFromHealthConnect(onPermissionRequired = {
-                                            viewModel.viewModelScope.launch {
-                                                missingPermissions = viewModel.healthConnectManager.getMissingPermissions()
-                                                showHealthPermissionDialog = true
-                                            }
-                                        })
-                                    } else {
-                                        // Nothing granted at all, ask for everything
-                                        healthConnectPermissionLauncher.launch(viewModel.healthConnectManager.permissions)
-                                    }
-                                }
+                                viewModel.syncFromStrava()
                             }) {
-                                Icon(Icons.Default.Sync, contentDescription = "Sync Health Connect")
-                            }
-                        } else {
-                            // If unavailable, show a download icon to install/setup Health Connect
-                            IconButton(onClick = {
-                                val intent = Intent(Intent.ACTION_VIEW).apply {
-                                    data = Uri.parse("market://details?id=com.google.android.apps.healthdata")
-                                    setPackage("com.android.vending")
-                                }
-                                try {
-                                    context.startActivity(intent)
-                                } catch (e: Exception) {
-                                    // Fallback to web browser if Play Store is missing
-                                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=com.google.android.apps.healthdata")))
-                                }
-                            }) {
-                                Icon(Icons.Default.Download, contentDescription = "Install Health Connect")
+                                Icon(Icons.Default.Sync, contentDescription = "Sync Strava")
                             }
                         }
                     }

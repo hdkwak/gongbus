@@ -200,6 +200,7 @@ async fn main() {
         .route("/users/:id/dashboard", get(get_dashboard))
         .route("/users/:id", get(get_user_profile).put(update_user_profile))
         .route("/users/:id/strava-link", post(get_strava_link))
+        .route("/users/:id/strava-sync", post(trigger_strava_sync))
         .route("/strava/callback", get(strava_callback))
         .route("/upload-run", post(upload_run))
         .route("/upload-avatar", post(upload_avatar))
@@ -257,6 +258,72 @@ async fn get_strava_link(State(state): State<AppState>, Path(id): Path<i32>) -> 
         id
     );
     Ok(Json(serde_json::json!({ "url": url })))
+}
+
+async fn trigger_strava_sync(State(state): State<AppState>, Path(user_id): Path<i32>) -> Result<StatusCode, (StatusCode, String)> {
+    let db = state.get_db().await?;
+
+    // Get valid access token
+    let access_token = get_strava_access_token(&db, &state.strava_config, user_id).await.map_err(|e| {
+        error!("Failed to get Strava access token for user {}: {:?}", user_id, e);
+        e
+    })?;
+
+    info!("Starting manual Strava sync for user {}", user_id);
+    let client = reqwest::Client::new();
+    let response = client.get("https://www.strava.com/api/v3/athlete/activities")
+        .query(&[("per_page", "10")])
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Strava API request failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+
+    if !response.status().is_success() {
+        let err_body = response.text().await.unwrap_or_default();
+        error!("Strava API returned error: {} - {}", response.status(), err_body);
+        return Err((response.status(), err_body));
+    }
+
+    let activities: Vec<serde_json::Value> = response.json().await.map_err(|e| {
+        error!("Failed to parse Strava activities JSON: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    info!("Found {} activities to sync from Strava", activities.len());
+    for act in activities {
+        let title = act.get("name").and_then(|v| v.as_str()).unwrap_or("Strava Run").to_string();
+        let start_time_str = act.get("start_date").and_then(|v| v.as_str()).unwrap_or_default();
+        let start_time = chrono::DateTime::parse_from_rfc3339(start_time_str).map(|dt| dt.with_timezone(&chrono::Utc)).unwrap_or_else(|_| chrono::Utc::now());
+        let distance = act.get("distance").and_then(|v| v.as_f64()).unwrap_or(0.0) as i32;
+        let duration = act.get("moving_time").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let avg_hr = act.get("average_heartrate").and_then(|v| v.as_f64()).map(|v| v as i32);
+        let max_hr = act.get("max_heartrate").and_then(|v| v.as_f64()).map(|v| v as i32);
+        let calories = act.get("calories").and_then(|v| v.as_f64()).map(|v| v as i32);
+
+        let route_wkt = if let Some(polyline_str) = act.get("map").and_then(|m| m.get("summary_polyline")).and_then(|v| v.as_str()) {
+            if let Ok(coords) = polyline::decode_polyline(polyline_str, 5) {
+                let points: Vec<String> = coords.into_iter().map(|p| format!("{} {}", p.x, p.y)).collect();
+                if points.len() >= 2 {
+                    Some(format!("LINESTRING({})", points.join(",")))
+                } else { None }
+            } else { None }
+        } else { None };
+
+        sqlx::query(
+            "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, avg_heart_rate, max_heart_rate, total_calories)
+             VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9)
+             ON CONFLICT (user_id, start_time) DO UPDATE SET
+             title=EXCLUDED.title, distance_meters=EXCLUDED.distance_meters, duration_seconds=EXCLUDED.duration_seconds,
+             route_line=EXCLUDED.route_line, avg_heart_rate=EXCLUDED.avg_heart_rate, max_heart_rate=EXCLUDED.max_heart_rate, total_calories=EXCLUDED.total_calories"
+        )
+        .bind(user_id).bind(title).bind(start_time).bind(distance).bind(duration).bind(route_wkt).bind(avg_hr).bind(max_hr).bind(calories)
+        .execute(&db).await.ok();
+    }
+
+    Ok(StatusCode::OK)
 }
 
 #[derive(Deserialize)]
@@ -317,11 +384,22 @@ async fn verify_strava_webhook(State(state): State<AppState>, Query(query): Quer
 async fn get_strava_access_token(db: &PgPool, config: &StravaConfig, user_id: i32) -> Result<String, (StatusCode, String)> {
     let row = sqlx::query("SELECT strava_access_token, strava_refresh_token, strava_token_expires_at FROM users WHERE id = $1")
         .bind(user_id)
-        .fetch_one(db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .fetch_one(db).await.map_err(|e| {
+            error!("Failed to fetch user for Strava token: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "User not found".to_string())
+        })?;
 
-    let access_token: String = row.get(0);
-    let refresh_token: String = row.get(1);
-    let expires_at: chrono::DateTime<chrono::Utc> = row.get(2);
+    let access_token: Option<String> = row.get(0);
+    let refresh_token: Option<String> = row.get(1);
+    let expires_at: Option<chrono::DateTime<chrono::Utc>> = row.get(2);
+
+    if access_token.is_none() || refresh_token.is_none() || expires_at.is_none() {
+        return Err((StatusCode::BAD_REQUEST, "Strava account not linked".to_string()));
+    }
+
+    let access_token = access_token.unwrap();
+    let refresh_token = refresh_token.unwrap();
+    let expires_at = expires_at.unwrap();
 
     // Refresh if expiring in less than 5 minutes
     if expires_at < chrono::Utc::now() + chrono::Duration::minutes(5) {
@@ -336,18 +414,36 @@ async fn get_strava_access_token(db: &PgPool, config: &StravaConfig, user_id: i3
             ])
             .send()
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Refresh request failed: {}", e)))?;
+            .map_err(|e| {
+                error!("Strava refresh request failed: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Refresh request failed: {}", e))
+            })?;
 
-        let token_data: serde_json::Value = response.json().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse refresh response: {}", e)))?;
+        let token_data: serde_json::Value = response.json().await.map_err(|e| {
+            error!("Failed to parse Strava refresh response: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse refresh response: {}", e))
+        })?;
 
-        let new_access_token = token_data.get("access_token").and_then(|v| v.as_str()).ok_or((StatusCode::INTERNAL_SERVER_ERROR, "No new access token".to_string()))?;
-        let new_refresh_token = token_data.get("refresh_token").and_then(|v| v.as_str()).ok_or((StatusCode::INTERNAL_SERVER_ERROR, "No new refresh token".to_string()))?;
-        let new_expires_at = token_data.get("expires_at").and_then(|v| v.as_i64()).ok_or((StatusCode::INTERNAL_SERVER_ERROR, "No new expires_at".to_string()))?;
+        let new_access_token = token_data.get("access_token").and_then(|v| v.as_str()).ok_or_else(|| {
+            error!("No access_token in refresh response: {:?}", token_data);
+            (StatusCode::INTERNAL_SERVER_ERROR, "No new access token".to_string())
+        })?;
+        let new_refresh_token = token_data.get("refresh_token").and_then(|v| v.as_str()).ok_or_else(|| {
+            error!("No refresh_token in refresh response");
+            (StatusCode::INTERNAL_SERVER_ERROR, "No new refresh token".to_string())
+        })?;
+        let new_expires_at = token_data.get("expires_at").and_then(|v| v.as_i64()).ok_or_else(|| {
+            error!("No expires_at in refresh response");
+            (StatusCode::INTERNAL_SERVER_ERROR, "No new expires_at".to_string())
+        })?;
         let new_expires_at_dt = chrono::DateTime::<chrono::Utc>::from_timestamp(new_expires_at, 0).unwrap_or_else(|| chrono::Utc::now());
 
         sqlx::query("UPDATE users SET strava_access_token = $1, strava_refresh_token = $2, strava_token_expires_at = $3 WHERE id = $4")
             .bind(new_access_token).bind(new_refresh_token).bind(new_expires_at_dt).bind(user_id)
-            .execute(db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .execute(db).await.map_err(|e| {
+                error!("Failed to update Strava tokens in DB: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })?;
 
         Ok(new_access_token.to_string())
     } else {

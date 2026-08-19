@@ -73,7 +73,6 @@ dependencies {
     implementation(libs.retrofit.gson)
     implementation(libs.okhttp)
     implementation(libs.okhttp.logging)
-    implementation(libs.health.connect.client)
 
     // Room
     implementation(libs.room.runtime)
