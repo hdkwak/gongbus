@@ -29,7 +29,11 @@ data class ActivityEntity(
             start_time = start_time,
             distance_meters = distance_meters,
             duration_seconds = duration_seconds,
-            route_line_geojson = route_line_geojson?.let { gson.fromJson(it, Any::class.java) },
+            route_line_geojson = try {
+                route_line_geojson?.let { gson.fromJson(it, Any::class.java) }
+            } catch (_: Exception) {
+                null
+            },
             username = username,
             avatar_url = avatar_url,
             avg_heart_rate = avg_heart_rate,

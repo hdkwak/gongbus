@@ -1,7 +1,9 @@
 package com.hidong.gongbus
 
+import android.app.Application
 import android.app.DatePickerDialog
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
@@ -13,6 +15,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.health.connect.client.HealthConnectClient
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -25,7 +28,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.Comment
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -40,6 +42,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -51,10 +54,14 @@ import com.google.android.gms.maps.model.LatLngBounds
 import com.google.android.gms.maps.model.RoundCap
 import com.google.maps.android.compose.*
 import com.hidong.gongbus.ui.theme.GongbusTheme
+import com.google.gson.Gson
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.*
@@ -67,6 +74,7 @@ import kotlin.math.roundToInt
 // --- Models ---
 data class ActivityFeedItem(
     val id: Int,
+    val user_id: Int,
     val title: String?,
     val start_time: String,
     val distance_meters: Int?,
@@ -100,6 +108,7 @@ data class Comment(
 
 data class ActivityDetail(
     val id: Int,
+    val user_id: Int = 0,
     val title: String?,
     val start_time: String,
     val distance_meters: Int?,
@@ -121,6 +130,7 @@ data class WeeklyMileage(
 )
 
 data class LeaderboardEntry(
+    val user_id: Int,
     val username: String?,
     val avatar_url: String?,
     val total_meters: Long
@@ -143,8 +153,11 @@ data class UserProfile(
     val monthly_target_km: Double?,
     val target_lsd_count: Int?,
     val target_race: String?,
-    val race_date: String?
+    val race_date: String?,
+    val strava_athlete_id: Long? = null
 )
+
+data class StravaLinkResponse(val url: String)
 
 data class AvatarResponse(val url: String)
 
@@ -154,10 +167,13 @@ data class LikePayload(val user_id: Int)
 // --- API ---
 interface RunningApi {
     @GET("feed")
-    suspend fun getFeed(): List<ActivityFeedItem>
+    suspend fun getFeed(@Query("user_id") userId: Int? = null): List<ActivityFeedItem>
 
     @GET("activities/{id}")
     suspend fun getActivity(@Path("id") id: Int): ActivityDetail
+
+    @PUT("activities/{id}")
+    suspend fun updateActivity(@Path("id") id: Int, @Body payload: Map<String, String?>): retrofit2.Response<Unit>
 
     @DELETE("activities/{id}")
     suspend fun deleteActivity(@Path("id") id: Int): retrofit2.Response<Unit>
@@ -170,6 +186,12 @@ interface RunningApi {
 
     @GET("users/{id}/dashboard")
     suspend fun getDashboard(@Path("id") id: Int): DashboardData
+
+    @GET("users")
+    suspend fun getUsers(): List<UserProfile>
+
+    @POST("users/{id}/strava-link")
+    suspend fun getStravaLinkUrl(@Path("id") id: Int): StravaLinkResponse
 
     @GET("users/{id}")
     suspend fun getUserProfile(@Path("id") id: Int): UserProfile
@@ -184,47 +206,108 @@ interface RunningApi {
     @POST("upload-avatar")
     suspend fun uploadAvatar(@Part file: MultipartBody.Part): AvatarResponse
 
+    @POST("activities")
+    suspend fun syncActivity(@Body activity: ActivityDetail): retrofit2.Response<Unit>
+
     @Multipart
     @POST("upload-run")
-    suspend fun uploadRun(@Part file: MultipartBody.Part, @Part("user_id") userId: Int)
+    suspend fun uploadRun(
+        @Part file: MultipartBody.Part, 
+        @Part("user_id") userId: Int,
+        @Part("title") title: okhttp3.RequestBody? = null
+    )
 
     companion object {
         private const val BASE_URL = "https://gongbus-api.onrender.com/" // REPLACE WITH YOUR RENDER URL
 
-        fun create(): RunningApi = Retrofit.Builder()
-            .baseUrl(BASE_URL)
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-            .create(RunningApi::class.java)
+        fun create(): RunningApi {
+            val logging = HttpLoggingInterceptor().apply {
+                level = HttpLoggingInterceptor.Level.BODY
+            }
+            val client = okhttp3.OkHttpClient.Builder()
+                .addInterceptor(logging)
+                .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+
+            return Retrofit.Builder()
+                .baseUrl(BASE_URL)
+                .client(client)
+                .addConverterFactory(GsonConverterFactory.create())
+                .build()
+                .create(RunningApi::class.java)
+        }
     }
 }
 
 // --- ViewModel ---
-class MainViewModel : ViewModel() {
+class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val api = RunningApi.create()
+    private val prefs = application.getSharedPreferences("gongbus_prefs", Context.MODE_PRIVATE)
+    private val db = AppDatabase.getDatabase(application)
+    private val activityDao = db.activityDao()
+    private val gson = Gson()
+    val healthConnectManager = HealthConnectManager(application)
+
     var activities by mutableStateOf<List<ActivityFeedItem>>(emptyList())
+    var members by mutableStateOf<List<UserProfile>>(emptyList())
     var selectedActivity by mutableStateOf<ActivityDetail?>(null)
     var dashboardData by mutableStateOf<DashboardData?>(null)
     var userProfile by mutableStateOf<UserProfile?>(null)
     var profileNotFound by mutableStateOf(false)
+
+    var filterUserId by mutableStateOf<Int?>(null)
+    var filterUsername by mutableStateOf<String?>(null)
     
     var isFeedLoading by mutableStateOf(false)
     var isDetailLoading by mutableStateOf(false)
     var isDashboardLoading by mutableStateOf(false)
     var isProfileLoading by mutableStateOf(false)
+    var isMembersLoading by mutableStateOf(false)
     var isUploading by mutableStateOf(false)
     var uploadStatus = mutableStateOf<String?>(null)
 
     init { 
-        fetchProfile()
-        fetchFeed()
+        val savedId = prefs.getInt("user_id", -1)
+        if (savedId != -1) {
+            fetchProfile(savedId)
+        } else {
+            profileNotFound = true
+        }
+        
+        // Load from local cache immediately
+        viewModelScope.launch {
+            loadLocalActivities()
+            fetchFeed() // Then sync with network
+        }
+    }
+
+    private suspend fun loadLocalActivities() {
+        val entities = withContext(Dispatchers.IO) {
+            if (filterUserId != null) {
+                activityDao.getByUserId(filterUserId!!)
+            } else {
+                activityDao.getAll()
+            }
+        }
+        activities = entities.map { it.toModel(gson) }
     }
 
     fun fetchFeed() {
         viewModelScope.launch {
             isFeedLoading = true
             try { 
-                activities = api.getFeed() 
+                val currentFilter = filterUserId
+                val networkActivities = api.getFeed(currentFilter)
+                
+                // Save to local cache (Upsert)
+                withContext(Dispatchers.IO) {
+                    activityDao.insertAll(networkActivities.map { it.toEntity(gson) })
+                }
+                
+                // Reload from local to ensure UI is in sync with cache
+                loadLocalActivities()
             } catch (e: Exception) { 
                 uploadStatus.value = "Feed error: ${e.message}"
                 e.printStackTrace() 
@@ -232,21 +315,51 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    fun setFeedFilter(userId: Int?, username: String?) {
+        filterUserId = userId
+        filterUsername = username
+        viewModelScope.launch {
+            loadLocalActivities()
+            fetchFeed()
+        }
+    }
+
+    fun fetchMembers() {
+        viewModelScope.launch {
+            isMembersLoading = true
+            try {
+                members = api.getUsers()
+            } catch (e: Exception) {
+                e.printStackTrace()
+                uploadStatus.value = "Failed to load members"
+            } finally {
+                isMembersLoading = false
+            }
+        }
+    }
+
     fun fetchDashboard() {
-        val userId = userProfile?.id ?: 1
+        val userId = userProfile?.id ?: prefs.getInt("user_id", -1)
+        if (userId == -1) return
+
         viewModelScope.launch {
             isDashboardLoading = true
             try { dashboardData = api.getDashboard(userId) } catch (e: Exception) { e.printStackTrace() } finally { isDashboardLoading = false }
         }
     }
 
-    fun fetchProfile() {
+    fun fetchProfile(id: Int? = null) {
+        val targetId = id ?: userProfile?.id ?: prefs.getInt("user_id", -1)
+        if (targetId == -1) {
+            profileNotFound = true
+            return
+        }
+
         viewModelScope.launch {
             isProfileLoading = true
             profileNotFound = false
             try { 
-                // Try to find any user first, then default to 1
-                userProfile = api.getUserProfile(1) 
+                userProfile = api.getUserProfile(targetId) 
                 fetchDashboard()
             } catch (e: Exception) { 
                 if (e.message?.contains("404") == true) {
@@ -277,6 +390,10 @@ class MainViewModel : ViewModel() {
                 val created = api.createProfile(newProfile)
                 userProfile = created
                 profileNotFound = false
+                
+                // SAVE THE NEW ID LOCALLY
+                prefs.edit().putInt("user_id", created.id).apply()
+                
                 uploadStatus.value = "Profile created!"
                 fetchFeed()
                 fetchDashboard()
@@ -292,7 +409,8 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch {
             try {
                 var updatedProfile = profile
-                val userId = userProfile?.id ?: 1
+                val userId = userProfile?.id ?: prefs.getInt("user_id", -1)
+                if (userId == -1) return@launch
                 
                 if (localAvatarUri != null) {
                     val file = uriToFile(context, localAvatarUri)
@@ -313,6 +431,19 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    fun linkStrava(context: Context) {
+        val userId = userProfile?.id ?: return
+        viewModelScope.launch {
+            try {
+                val response = api.getStravaLinkUrl(userId)
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(response.url))
+                context.startActivity(intent)
+            } catch (e: Exception) {
+                uploadStatus.value = "Failed to start Strava link: ${e.message}"
+            }
+        }
+    }
+
     fun deleteActivity(id: Int) {
         viewModelScope.launch {
             try {
@@ -322,6 +453,10 @@ class MainViewModel : ViewModel() {
                     activities = activities.filter { it.id != id }
                     dashboardData = dashboardData?.let { current ->
                         current.copy(activities = current.activities.filter { it.id != id })
+                    }
+                    // Delete from local cache
+                    withContext(Dispatchers.IO) {
+                        activityDao.deleteById(id)
                     }
                     fetchDashboard()
                 } else {
@@ -333,10 +468,30 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    fun updateActivityTitle(id: Int, newTitle: String) {
+        viewModelScope.launch {
+            try {
+                val response = api.updateActivity(id, mapOf("title" to newTitle))
+                if (response.isSuccessful) {
+                    uploadStatus.value = "Title updated!"
+                    fetchFeed()
+                    if (selectedActivity?.id == id) {
+                        fetchActivityDetail(id)
+                    }
+                } else {
+                    uploadStatus.value = "Update failed: ${response.code()}"
+                }
+            } catch (e: Exception) {
+                uploadStatus.value = "Update error: ${e.message}"
+            }
+        }
+    }
+
     fun likeActivity(id: Int) {
         viewModelScope.launch {
             try {
-                val userId = userProfile?.id ?: 1
+                val userId = userProfile?.id ?: prefs.getInt("user_id", -1)
+                if (userId == -1) return@launch
                 val response = api.likeActivity(id, LikePayload(user_id = userId))
                 if (response.isSuccessful) {
                     fetchFeed()
@@ -351,7 +506,8 @@ class MainViewModel : ViewModel() {
     fun addComment(id: Int, text: String) {
         viewModelScope.launch {
             try {
-                val userId = userProfile?.id ?: 1
+                val userId = userProfile?.id ?: prefs.getInt("user_id", -1)
+                if (userId == -1) return@launch
                 val response = api.commentActivity(id, CommentPayload(user_id = userId, comment_text = text))
                 if (response.isSuccessful) {
                     fetchFeed()
@@ -370,7 +526,62 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch {
             selectedActivity = null
             isDetailLoading = true
-            try { selectedActivity = api.getActivity(id) } catch (e: Exception) { uploadStatus.value = "Error: ${e.message}" } finally { isDetailLoading = false }
+            try { 
+                selectedActivity = api.getActivity(id) 
+            } catch (e: Exception) { 
+                uploadStatus.value = "Error: ${e.message}"
+            } finally { isDetailLoading = false }
+        }
+    }
+
+    fun syncFromHealthConnect(onPermissionRequired: () -> Unit = {}) {
+        viewModelScope.launch {
+            isUploading = true
+            try {
+                val userId = userProfile?.id ?: prefs.getInt("user_id", -1)
+                if (userId == -1) {
+                    uploadStatus.value = "Profile not found"
+                    return@launch
+                }
+
+                // Check if we have at least session permission
+                if (!healthConnectManager.hasAnyPermissions()) {
+                    onPermissionRequired()
+                    isUploading = false
+                    return@launch
+                }
+
+                val sessions = healthConnectManager.fetchRecentActivities()
+                if (sessions.isEmpty()) {
+                    uploadStatus.value = "No recent runs found in Health Connect"
+                    return@launch
+                }
+
+                var syncCount = 0
+                for (session in sessions) {
+                    try {
+                        val detail = healthConnectManager.getSessionDetails(session)
+                        val response = api.syncActivity(detail.copy(
+                            user_id = userId,
+                            username = userProfile?.username ?: ""
+                        ))
+                        if (response.isSuccessful) syncCount++
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+                uploadStatus.value = if (syncCount > 0) "Synced $syncCount activities" else "All activities already synced"
+                fetchFeed()
+            } catch (e: Exception) {
+                if (e.message?.contains("permission", ignoreCase = true) == true || e is SecurityException) {
+                    onPermissionRequired()
+                } else {
+                    uploadStatus.value = "Sync failed: ${e.message}"
+                }
+                e.printStackTrace()
+            } finally {
+                isUploading = false
+            }
         }
     }
 
@@ -378,10 +589,19 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch {
             isUploading = true
             try {
-                val userId = userProfile?.id ?: 1
+                val userId = userProfile?.id ?: prefs.getInt("user_id", -1)
+                if (userId == -1) {
+                    uploadStatus.value = "Please create a profile first"
+                    return@launch
+                }
                 val file = uriToFile(context, uri)
                 val body = MultipartBody.Part.createFormData("file", file.name, file.asRequestBody("application/octet-stream".toMediaTypeOrNull()))
-                api.uploadRun(body, userId)
+                
+                // Use filename without extension as default title
+                val defaultTitle = file.nameWithoutExtension.replace("_", " ").replace("-", " ")
+                val titleBody = okhttp3.RequestBody.create("text/plain".toMediaTypeOrNull(), defaultTitle)
+                
+                api.uploadRun(body, userId, titleBody)
                 uploadStatus.value = "Upload Successful!"
                 fetchFeed()
                 fetchDashboard()
@@ -410,6 +630,7 @@ class MainViewModel : ViewModel() {
 sealed class Screen(val title: String, val icon: ImageVector) {
     object Feed : Screen("Feed", Icons.Default.Home)
     object Dashboard : Screen("Dashboard", Icons.Default.Dashboard)
+    object Members : Screen("Members", Icons.Default.Group)
     object Profile : Screen("Profile", Icons.Default.Person)
 }
 
@@ -417,6 +638,12 @@ sealed class Screen(val title: String, val icon: ImageVector) {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        
+        // Add global exception handler for easier debugging
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            android.util.Log.e("GongbusCrash", "Uncaught exception in thread ${thread.name}", throwable)
+        }
+
         enableEdgeToEdge()
         setContent { GongbusTheme { MainScreen() } }
     }
@@ -462,7 +689,7 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
         Scaffold(
             bottomBar = {
                 NavigationBar {
-                    listOf(Screen.Feed, Screen.Dashboard, Screen.Profile).forEach { screen ->
+                    listOf(Screen.Feed, Screen.Dashboard, Screen.Members, Screen.Profile).forEach { screen ->
                         NavigationBarItem(
                             icon = { Icon(screen.icon, null) },
                             label = { Text(screen.title) },
@@ -471,6 +698,7 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
                                 currentScreen = screen
                                 when(screen) {
                                     Screen.Dashboard -> viewModel.fetchDashboard()
+                                    Screen.Members -> viewModel.fetchMembers()
                                     Screen.Profile -> viewModel.fetchProfile()
                                     else -> {}
                                 }
@@ -491,7 +719,12 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
                         onDeleteClick = { id -> activityToDelete = id }
                     )
                     Screen.Dashboard -> DashboardScreen(
-                        viewModel = viewModel
+                        viewModel = viewModel,
+                        onUserSelected = { currentScreen = Screen.Feed }
+                    )
+                    Screen.Members -> MembersScreen(
+                        viewModel = viewModel,
+                        onUserSelected = { currentScreen = Screen.Feed }
                     )
                     Screen.Profile -> ProfileScreen(viewModel)
                 }
@@ -504,7 +737,86 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
 fun FeedScreen(viewModel: MainViewModel, onActivityClick: (Int) -> Unit, onDeleteClick: (Int) -> Unit) {
     val context = LocalContext.current
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> uri?.let { viewModel.uploadFitFile(context, it) } }
+    var missingPermissions by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var showHealthPermissionDialog by remember { mutableStateOf(false) }
+    
+    val healthConnectPermissionLauncher = rememberLauncherForActivityResult(viewModel.healthConnectManager.requestPermissionsContract()) { granted ->
+        viewModel.viewModelScope.launch {
+            val missing = viewModel.healthConnectManager.getMissingPermissions()
+            if (missing.isEmpty()) {
+                viewModel.syncFromHealthConnect()
+            } else {
+                missingPermissions = missing
+                showHealthPermissionDialog = true
+            }
+        }
+    }
+
     var activityForComments by remember { mutableStateOf<Int?>(null) }
+    var activityForTitleEdit by remember { mutableStateOf<ActivityFeedItem?>(null) }
+
+    if (showHealthPermissionDialog) {
+        AlertDialog(
+            onDismissRequest = { showHealthPermissionDialog = false },
+            title = { Text("Health Connect Permission") },
+            text = {
+                Column {
+                    Text("Gongbus needs permission to read your activity data from Health Connect.")
+                    if (missingPermissions.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text("Missing: ${missingPermissions.joinToString(", ").replace("android.permission.health.READ_", "")}", style = MaterialTheme.typography.bodySmall, color = Color.Red)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text("Please enable all permissions (Exercise Sessions, Heart Rate, etc.) in the Gongbus settings inside the Health Connect app.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                }
+            },
+            confirmButton = {
+                Row {
+                    TextButton(onClick = {
+                        showHealthPermissionDialog = false
+                        viewModel.syncFromHealthConnect()
+                    }) { Text("Proceed Anyway") }
+                    Spacer(Modifier.width(8.dp))
+                    Button(onClick = {
+                        showHealthPermissionDialog = false
+                        try {
+                            context.startActivity(viewModel.healthConnectManager.getSettingsIntent())
+                        } catch (e: Exception) {
+                            viewModel.uploadStatus.value = "Settings could not be opened"
+                        }
+                    }) { Text("Open Settings") }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showHealthPermissionDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    if (activityForTitleEdit != null) {
+        var newTitle by remember { mutableStateOf(activityForTitleEdit?.title ?: "") }
+        AlertDialog(
+            onDismissRequest = { activityForTitleEdit = null },
+            title = { Text("Edit Activity Name") },
+            text = {
+                OutlinedTextField(
+                    value = newTitle,
+                    onValueChange = { newTitle = it },
+                    label = { Text("Activity Name") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    activityForTitleEdit?.let { viewModel.updateActivityTitle(it.id, newTitle) }
+                    activityForTitleEdit = null
+                }) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = { activityForTitleEdit = null }) { Text("Cancel") }
+            }
+        )
+    }
 
     if (activityForComments != null) {
         // Fetch details to get comments
@@ -537,7 +849,11 @@ fun FeedScreen(viewModel: MainViewModel, onActivityClick: (Int) -> Unit, onDelet
                                     }
                                     Spacer(Modifier.width(8.dp))
                                     Column {
-                                        Text(comment.username, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(comment.username, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+                                            Spacer(Modifier.width(8.dp))
+                                            Text(formatUtcToLocal(comment.created_at, true), style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                                        }
                                         Text(comment.comment_text, style = MaterialTheme.typography.bodyMedium)
                                     }
                                 }
@@ -571,14 +887,88 @@ fun FeedScreen(viewModel: MainViewModel, onActivityClick: (Int) -> Unit, onDelet
     Box(modifier = Modifier.fillMaxSize()) {
         if (viewModel.isFeedLoading || viewModel.isUploading) CircularProgressIndicator(Modifier.align(Alignment.Center))
         LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            item { Text("Recent Runs", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold) }
+            item {
+                Column {
+                    Text("Recent Runs", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(8.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        FilterChip(
+                            selected = viewModel.filterUserId == null,
+                            onClick = { viewModel.setFeedFilter(null, null) },
+                            label = { Text("All") }
+                        )
+                        FilterChip(
+                            selected = viewModel.filterUserId == viewModel.userProfile?.id && viewModel.filterUserId != null,
+                            onClick = { viewModel.setFeedFilter(viewModel.userProfile?.id, "Me") },
+                            label = { Text("Mine") }
+                        )
+                        
+                        Spacer(Modifier.weight(1f))
+                        
+                        val healthStatus = viewModel.healthConnectManager.isAvailable()
+                        if (healthStatus == HealthConnectManager.SDK_AVAILABLE) {
+                            IconButton(onClick = {
+                                viewModel.viewModelScope.launch {
+                                    val granted = viewModel.healthConnectManager.hasAnyPermissions()
+                                    if (granted) {
+                                        // We have at least something, try to sync
+                                        viewModel.syncFromHealthConnect(onPermissionRequired = {
+                                            viewModel.viewModelScope.launch {
+                                                missingPermissions = viewModel.healthConnectManager.getMissingPermissions()
+                                                showHealthPermissionDialog = true
+                                            }
+                                        })
+                                    } else {
+                                        // Nothing granted at all, ask for everything
+                                        healthConnectPermissionLauncher.launch(viewModel.healthConnectManager.permissions)
+                                    }
+                                }
+                            }) {
+                                Icon(Icons.Default.Sync, contentDescription = "Sync Health Connect")
+                            }
+                        } else {
+                            // If unavailable, show a download icon to install/setup Health Connect
+                            IconButton(onClick = {
+                                val intent = Intent(Intent.ACTION_VIEW).apply {
+                                    data = Uri.parse("market://details?id=com.google.android.apps.healthdata")
+                                    setPackage("com.android.vending")
+                                }
+                                try {
+                                    context.startActivity(intent)
+                                } catch (e: Exception) {
+                                    // Fallback to web browser if Play Store is missing
+                                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=com.google.android.apps.healthdata")))
+                                }
+                            }) {
+                                Icon(Icons.Default.Download, contentDescription = "Install Health Connect")
+                            }
+                        }
+                    }
+                    if (viewModel.filterUserId != null && viewModel.filterUserId != viewModel.userProfile?.id) {
+                        FilterChip(
+                            selected = true,
+                            onClick = { },
+                            label = { Text("User: ${viewModel.filterUsername}") },
+                            trailingIcon = {
+                                Icon(
+                                    Icons.Default.Close,
+                                    null,
+                                    Modifier.size(16.dp).clickable { viewModel.setFeedFilter(null, null) }
+                                )
+                            }
+                        )
+                    }
+                }
+            }
             items(viewModel.activities) { activity -> 
                 ActivityCard(
                     activity = activity, 
                     onClick = onActivityClick,
                     onDelete = { onDeleteClick(activity.id) },
                     onLike = { viewModel.likeActivity(activity.id) },
-                    onComment = { activityForComments = activity.id }
+                    onComment = { activityForComments = activity.id },
+                    onUserClick = { id, name -> viewModel.setFeedFilter(id, name) },
+                    onEditTitle = { activityForTitleEdit = activity }
                 ) 
             }
         }
@@ -588,7 +978,15 @@ fun FeedScreen(viewModel: MainViewModel, onActivityClick: (Int) -> Unit, onDelet
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ActivityCard(activity: ActivityFeedItem, onClick: (Int) -> Unit, onDelete: () -> Unit, onLike: () -> Unit, onComment: () -> Unit) {
+fun ActivityCard(
+    activity: ActivityFeedItem, 
+    onClick: (Int) -> Unit, 
+    onDelete: () -> Unit, 
+    onLike: () -> Unit, 
+    onComment: () -> Unit,
+    onUserClick: (Int, String) -> Unit,
+    onEditTitle: (String) -> Unit
+) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         elevation = CardDefaults.cardElevation(2.dp)
@@ -613,12 +1011,48 @@ fun ActivityCard(activity: ActivityFeedItem, onClick: (Int) -> Unit, onDelete: (
                     }
                     Spacer(Modifier.width(12.dp))
                     Column {
-                        Text(activity.username ?: "Unknown Runner", fontWeight = FontWeight.Bold)
-                        Text(activity.start_time.substringBefore("T"), style = MaterialTheme.typography.bodySmall)
+                        Text(
+                            activity.username ?: "Unknown Runner", 
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.clickable { onUserClick(activity.user_id, activity.username ?: "Unknown") }
+                        )
+                        Text(formatUtcToLocal(activity.start_time), style = MaterialTheme.typography.bodySmall)
                     }
                 }
-                IconButton(onClick = { onDelete() }) {
-                    Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error)
+                var showMenu by remember { mutableStateOf(false) }
+                Box {
+                    IconButton(onClick = { showMenu = true }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "More")
+                    }
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = { showMenu = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Edit Name") },
+                            onClick = {
+                                showMenu = false
+                                onEditTitle(activity.title ?: "")
+                            },
+                            leadingIcon = { Icon(Icons.Default.Edit, null) }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Filter by this runner") },
+                            onClick = {
+                                showMenu = false
+                                onUserClick(activity.user_id, activity.username ?: "Unknown")
+                            },
+                            leadingIcon = { Icon(Icons.Default.FilterList, null) }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Delete", color = Color.Red) },
+                            onClick = {
+                                showMenu = false
+                                onDelete()
+                            },
+                            leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null, tint = Color.Red) }
+                        )
+                    }
                 }
             }
             
@@ -628,9 +1062,9 @@ fun ActivityCard(activity: ActivityFeedItem, onClick: (Int) -> Unit, onDelete: (
                 
                 Spacer(Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    SummaryStat("Avg HR", "${activity.avg_heart_rate ?: "--"}")
-                    SummaryStat("Avg Cad", "${activity.avg_cadence ?: "--"}")
-                    SummaryStat("Calories", "${activity.total_calories ?: "--"}")
+                    SummaryStat("Avg HR", (activity.avg_heart_rate ?: "--").toString())
+                    SummaryStat("Avg Cad", (activity.avg_cadence ?: "--").toString())
+                    SummaryStat("Calories", (activity.total_calories ?: "--").toString())
                     val distKm = (activity.distance_meters ?: 0) / 1000.0
                     SummaryStat("Dist", "%.1f km".format(distKm))
                 }
@@ -656,13 +1090,18 @@ fun ActivityCard(activity: ActivityFeedItem, onClick: (Int) -> Unit, onDelete: (
                         Text(text = activity.comment_count.toString(), style = MaterialTheme.typography.bodySmall)
                     }
                 }
+                Spacer(Modifier.weight(1f))
+                val context = LocalContext.current
+                IconButton(onClick = { shareActivity(context, activity) }) {
+                    Icon(Icons.Default.Share, contentDescription = "Share", modifier = Modifier.size(20.dp))
+                }
             }
         }
     }
 }
 
 @Composable
-fun DashboardScreen(viewModel: MainViewModel) {
+fun DashboardScreen(viewModel: MainViewModel, onUserSelected: () -> Unit) {
     val data = viewModel.dashboardData
     val profile = viewModel.userProfile
 
@@ -725,13 +1164,16 @@ fun DashboardScreen(viewModel: MainViewModel) {
 
             // Leaderboard
             Text("Top Runners (This Month)", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            LeaderboardSection(data.leaderboard)
+            LeaderboardSection(data.leaderboard) { userId, username ->
+                viewModel.setFeedFilter(userId, username)
+                onUserSelected()
+            }
         }
     }
 }
 
 @Composable
-fun LeaderboardSection(entries: List<LeaderboardEntry>) {
+fun LeaderboardSection(entries: List<LeaderboardEntry>, onUserClick: (Int, String) -> Unit) {
     if (entries.isEmpty()) {
         Text("No activity this month yet.", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
         return
@@ -743,6 +1185,7 @@ fun LeaderboardSection(entries: List<LeaderboardEntry>) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp))
+                    .clickable { onUserClick(entry.user_id, entry.username ?: "Unknown") }
                     .padding(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -1020,6 +1463,90 @@ fun ProfileScreen(viewModel: MainViewModel) {
             ) {
                 Text("Save Profile")
             }
+
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(8.dp))
+            
+            Text("Automatic Sync", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.align(Alignment.Start))
+            
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+            ) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Sync, null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Strava Sync", fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.weight(1f))
+                        if (profile.strava_athlete_id != null) {
+                            Text("Linked", color = Color(0xFF4CAF50), fontWeight = FontWeight.Bold)
+                        } else {
+                            Text("Not Linked", color = Color.Gray)
+                        }
+                    }
+                    Text(
+                        "Gongbus will automatically pull your activities from Strava (including maps). Connect Garmin to Strava first!",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray
+                    )
+                    Button(
+                        onClick = { viewModel.linkStrava(context) },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (profile.strava_athlete_id != null) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.primary
+                        )
+                    ) {
+                        Text(if (profile.strava_athlete_id != null) "Re-link Strava" else "Link Strava Account")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun MembersScreen(viewModel: MainViewModel, onUserSelected: () -> Unit) {
+    val members = viewModel.members
+    
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Text("Community Members", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(16.dp))
+        
+        if (viewModel.isMembersLoading) {
+            Box(Modifier.fillMaxSize(), Alignment.Center) { CircularProgressIndicator() }
+        } else if (members.isEmpty()) {
+            Box(Modifier.fillMaxSize(), Alignment.Center) { Text("No members found yet.", color = Color.Gray) }
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(members) { user ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth().clickable {
+                            viewModel.setFeedFilter(user.id, user.username)
+                            onUserSelected()
+                        },
+                        elevation = CardDefaults.cardElevation(2.dp)
+                    ) {
+                        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.size(48.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer), Alignment.Center) {
+                                if (user.avatar_url != null) {
+                                    AsyncImage(model = user.avatar_url, contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                                } else {
+                                    Icon(Icons.Default.Person, null, tint = MaterialTheme.colorScheme.primary)
+                                }
+                            }
+                            Spacer(Modifier.width(16.dp))
+                            Column {
+                                Text(user.username, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+                                Text("ID: ${user.id}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                            }
+                            Spacer(Modifier.weight(1f))
+                            Icon(Icons.Default.ChevronRight, null, tint = Color.Gray)
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1053,11 +1580,45 @@ fun DashboardStat(label: String, value: String, modifier: Modifier = Modifier) {
 fun ActivityDetailScreen(viewModel: MainViewModel, onBack: () -> Unit) {
     val activity = viewModel.selectedActivity
     var lapDistanceKm by remember { mutableStateOf(1.0f) }
+    var showEditTitleDialog by remember { mutableStateOf(false) }
+
+    if (showEditTitleDialog && activity != null) {
+        var newTitle by remember { mutableStateOf(activity.title ?: "") }
+        AlertDialog(
+            onDismissRequest = { showEditTitleDialog = false },
+            title = { Text("Edit Activity Name") },
+            text = {
+                OutlinedTextField(
+                    value = newTitle,
+                    onValueChange = { newTitle = it },
+                    label = { Text("Activity Name") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.updateActivityTitle(activity.id, newTitle)
+                    showEditTitleDialog = false
+                }) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEditTitleDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text(activity?.title ?: "Loading...", color = Color.White) },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Color.White) } },
+                actions = {
+                    if (activity != null) {
+                        IconButton(onClick = { showEditTitleDialog = true }) {
+                            Icon(Icons.Default.Edit, contentDescription = "Edit Title", tint = Color.White)
+                        }
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primary)
             )
         }
@@ -1068,10 +1629,10 @@ fun ActivityDetailScreen(viewModel: MainViewModel, onBack: () -> Unit) {
             Column(Modifier.padding(padding).fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), Arrangement.spacedBy(20.dp)) {
                 RouteMap(activity.route_line_geojson, Modifier.height(250.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    SummaryStat("Avg HR", "${activity.avg_heart_rate ?: "--"}")
-                    SummaryStat("Max HR", "${activity.max_heart_rate ?: "--"}")
-                    SummaryStat("Avg Cad", "${activity.avg_cadence ?: "--"}")
-                    SummaryStat("Calories", "${activity.total_calories ?: "--"}")
+                    SummaryStat("Avg HR", (activity.avg_heart_rate ?: "--").toString())
+                    SummaryStat("Max HR", (activity.max_heart_rate ?: "--").toString())
+                    SummaryStat("Avg Cad", (activity.avg_cadence ?: "--").toString())
+                    SummaryStat("Calories", (activity.total_calories ?: "--").toString())
                 }
                 Column {
                     Text("Lap Distance (km)", style = MaterialTheme.typography.labelMedium)
@@ -1096,8 +1657,7 @@ fun ActivityDetailScreen(viewModel: MainViewModel, onBack: () -> Unit) {
                     Spacer(Modifier.height(16.dp))
                     Text("Failed to load activity detail.")
                     Button(onClick = { 
-                        val id = (viewModel.selectedActivity as? ActivityDetail)?.id 
-                        // Note: we need the ID here. Let's pass it or store it.
+                        // Retry logic
                     }) {
                         Text("Retry")
                     }
@@ -1179,11 +1739,80 @@ fun MetricChart(title: String, data: List<Float?>?, inverted: Boolean = false, i
 @Composable
 fun RouteMap(geoJson: Any?, modifier: Modifier = Modifier.height(150.dp)) {
     val points = remember(geoJson) { parseGeoJson(geoJson) }
-    if (points.isEmpty()) Box(modifier.fillMaxWidth().background(Color.LightGray, RoundedCornerShape(8.dp)), Alignment.Center) { Text("No GPS") }
-    else GoogleMap(modifier = modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)), cameraPositionState = rememberCameraPositionState { val b = LatLngBounds.builder(); points.forEach { b.include(it) }; position = com.google.android.gms.maps.model.CameraPosition.fromLatLngZoom(b.build().center, 12f) }, googleMapOptionsFactory = { com.google.android.gms.maps.GoogleMapOptions().liteMode(true) }) { Polyline(points, color = MaterialTheme.colorScheme.primary, width = 8f) }
+    
+    if (points.isEmpty()) {
+        Box(modifier = modifier.fillMaxWidth().background(Color.LightGray, RoundedCornerShape(8.dp)), Alignment.Center) {
+            Text("No GPS")
+        }
+    } else {
+        val cameraPositionState = rememberCameraPositionState()
+        
+        // Use a flag to ensure we only zoom once per set of points
+        var initialZoomDone by remember(points) { mutableStateOf(false) }
+
+        GoogleMap(
+            modifier = modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)),
+            cameraPositionState = cameraPositionState,
+            onMapLoaded = {
+                if (!initialZoomDone && points.isNotEmpty()) {
+                    val builder = LatLngBounds.builder()
+                    points.forEach { builder.include(it) }
+                    try {
+                        cameraPositionState.move(CameraUpdateFactory.newLatLngBounds(builder.build(), 64))
+                        initialZoomDone = true
+                    } catch (e: Exception) {
+                        // Map might not be fully measured yet in some edge cases
+                    }
+                }
+            },
+            googleMapOptionsFactory = { 
+                com.google.android.gms.maps.GoogleMapOptions().liteMode(true) 
+            }
+        ) {
+            Polyline(
+                points = points,
+                color = MaterialTheme.colorScheme.primary,
+                width = 10f,
+                startCap = RoundCap(),
+                endCap = RoundCap()
+            )
+        }
+    }
+}
+
+fun decodePolyline(encoded: String): List<LatLng> {
+    val poly = ArrayList<LatLng>()
+    var index = 0
+    val len = encoded.length
+    var lat = 0
+    var lng = 0
+    while (index < len) {
+        var b: Int
+        var shift = 0
+        var result = 0
+        do {
+            b = encoded[index++].code - 63
+            result = result or (b and 0x1f shl shift)
+            shift += 5
+        } while (b >= 0x20)
+        val dlat = if (result and 1 != 0) (result shr 1).inv() else result shr 1
+        lat += dlat
+        shift = 0
+        result = 0
+        do {
+            b = encoded[index++].code - 63
+            result = result or (b and 0x1f shl shift)
+            shift += 5
+        } while (b >= 0x20)
+        val dlng = if (result and 1 != 0) (result shr 1).inv() else result shr 1
+        lng += dlng
+        poly.add(LatLng(lat.toDouble() / 1E5, lng.toDouble() / 1E5))
+    }
+    return poly
 }
 
 fun parseGeoJson(json: Any?): List<LatLng> {
+    if (json is String) return decodePolyline(json)
     return try {
         val m = json as Map<*, *>
         (m["coordinates"] as List<*>).map { val c = it as List<*>; LatLng(c[1] as Double, c[0] as Double) }
@@ -1208,4 +1837,59 @@ fun calculateDaysToRace(raceDateStr: String): Long? {
     } catch (e: Exception) {
         null
     }
+}
+
+fun formatUtcToLocal(utcString: String, includeTime: Boolean = true): String {
+    return try {
+        // Handle various ISO 8601 formats including those with nanoseconds from Rust
+        val cleaned = if (utcString.contains(".")) {
+            val parts = utcString.split(".")
+            parts[0] + "Z" // Strip fractional seconds for simpler parsing
+        } else {
+            utcString
+        }
+
+        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.getDefault())
+        sdf.timeZone = TimeZone.getTimeZone("UTC")
+        val date = sdf.parse(cleaned) ?: return utcString
+
+        val pattern = if (includeTime) "MMM dd, yyyy HH:mm" else "MMM dd, yyyy"
+        val localSdf = SimpleDateFormat(pattern, Locale.getDefault())
+        localSdf.format(date)
+    } catch (e: Exception) {
+        utcString.substringBefore("T")
+    }
+}
+
+fun shareActivity(context: Context, activity: ActivityFeedItem) {
+    val distKm = (activity.distance_meters ?: 0) / 1000.0
+    val duration = formatSecondsToHHMMSS(activity.duration_seconds)
+    val pace = if (distKm > 0 && activity.duration_seconds != null) {
+        val totalSeconds = activity.duration_seconds
+        val paceSeconds = (totalSeconds / distKm).toInt()
+        "%d:%02d".format(paceSeconds / 60, paceSeconds % 60)
+    } else "--"
+
+    val summary = """
+        🏃 Gongbus Run Summary
+        👤 Runner: ${activity.username ?: "Unknown"}
+        📅 Date: ${formatUtcToLocal(activity.start_time, includeTime = false)}
+        📝 Title: ${activity.title ?: "Morning Run"}
+        
+        📏 Distance: %.2f km
+        ⏱️ Duration: $duration
+        ⚡ Pace: $pace min/km
+        💓 Avg HR: ${activity.avg_heart_rate ?: "--"} bpm
+        
+        Check it out on Gongbus!
+    """.trimIndent().format(distKm)
+
+    val sendIntent: Intent = Intent().apply {
+        action = Intent.ACTION_SEND
+        putExtra(Intent.EXTRA_TEXT, summary)
+        type = "text/plain"
+    }
+
+    val shareIntent = Intent.createChooser(sendIntent, "Share Run Summary")
+    context.startActivity(shareIntent)
 }

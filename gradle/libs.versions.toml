@@ -1,5 +1,5 @@
 [versions]
-agp = "9.3.1"
+agp = "8.6.0"
 coreKtx = "1.10.1"
 junit = "4.13.2"
 junitVersion = "1.1.5"
@@ -7,11 +7,14 @@ espressoCore = "3.5.1"
 lifecycleRuntimeKtx = "2.6.1"
 lifecycleViewmodelCompose = "2.6.1"
 activityCompose = "1.8.0"
-kotlin = "2.2.10"
+kotlin = "2.0.20"
 composeBom = "2026.02.01"
 retrofit = "2.9.0"
 okhttp = "4.11.0"
 coil = "2.5.0"
+room = "2.6.1"
+ksp = "2.0.20-1.0.25"
+health-connect = "1.1.0-alpha11"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -37,7 +40,13 @@ okhttp-logging = { group = "com.squareup.okhttp3", name = "logging-interceptor",
 maps-compose = { group = "com.google.maps.android", name = "maps-compose", version = "4.4.1" }
 play-services-maps = { group = "com.google.android.gms", name = "play-services-maps", version = "19.0.0" }
 coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coil" }
+room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "room" }
+room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "room" }
+room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "room" }
+health-connect-client = { group = "androidx.health.connect", name = "connect-client", version.ref = "health-connect" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }

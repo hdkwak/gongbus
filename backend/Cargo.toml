@@ -20,6 +20,7 @@ tracing-subscriber = "0.3"
 uuid = { version = "1.0", features = ["v4"] }
 reqwest = { version = "0.11", features = ["json", "multipart", "native-tls"] }
 sha1 = "0.10"
+polyline = "0.10"
 
 # STRICT PINS for Rust 1.85 compatibility
 home = "=0.5.11"

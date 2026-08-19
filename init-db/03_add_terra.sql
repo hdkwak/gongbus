@@ -1,0 +1,1 @@
+ALTER TABLE users ADD COLUMN terra_user_id TEXT UNIQUE;
