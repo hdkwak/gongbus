@@ -48,6 +48,7 @@ struct StravaConfig {
 struct ActivityFeedItem {
     id: i32,
     user_id: i32,
+    strava_id: Option<i64>,
     title: Option<String>,
     start_time: chrono::DateTime<chrono::Utc>,
     distance_meters: Option<i32>,
@@ -86,6 +87,7 @@ struct Comment {
 struct ActivityDetail {
     id: i32,
     user_id: i32,
+    strava_id: Option<i64>,
     title: Option<String>,
     start_time: chrono::DateTime<chrono::Utc>,
     distance_meters: Option<i32>,
@@ -356,14 +358,15 @@ async fn trigger_strava_sync(State(state): State<AppState>, Path(user_id): Path<
             let ts_data = fetch_strava_time_series(activity_id, &access_token, start_time).await;
 
             sqlx::query(
-                "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, avg_cadence, total_calories)
-                 VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10, $11)
+                "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, avg_cadence, total_calories, strava_id)
+                 VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10, $11, $12)
                  ON CONFLICT (user_id, start_time) DO UPDATE SET
                  title=EXCLUDED.title, distance_meters=EXCLUDED.distance_meters, duration_seconds=EXCLUDED.duration_seconds,
                  route_line=EXCLUDED.route_line, time_series_data=EXCLUDED.time_series_data, avg_heart_rate=EXCLUDED.avg_heart_rate,
-                 max_heart_rate=EXCLUDED.max_heart_rate, avg_cadence=EXCLUDED.avg_cadence, total_calories=EXCLUDED.total_calories"
+                 max_heart_rate=EXCLUDED.max_heart_rate, avg_cadence=EXCLUDED.avg_cadence, total_calories=EXCLUDED.total_calories,
+                 strava_id=EXCLUDED.strava_id"
             )
-            .bind(user_id).bind(title).bind(start_time).bind(distance).bind(duration).bind(route_wkt).bind(ts_data).bind(avg_hr).bind(max_hr).bind(avg_cad).bind(calories)
+            .bind(user_id).bind(title).bind(start_time).bind(distance).bind(duration).bind(route_wkt).bind(ts_data).bind(avg_hr).bind(max_hr).bind(avg_cad).bind(calories).bind(activity_id)
             .execute(&db).await.ok();
         }
     }
@@ -551,14 +554,15 @@ async fn handle_strava_webhook(State(state): State<AppState>, Json(payload): Jso
                         let ts_data = fetch_strava_time_series(activity_id, &access_token, start_time).await;
 
                         sqlx::query(
-                            "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, avg_cadence, total_calories)
-                             VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10, $11)
+                            "INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, avg_cadence, total_calories, strava_id)
+                             VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10, $11, $12)
                              ON CONFLICT (user_id, start_time) DO UPDATE SET
                              title=EXCLUDED.title, distance_meters=EXCLUDED.distance_meters, duration_seconds=EXCLUDED.duration_seconds,
                              route_line=EXCLUDED.route_line, time_series_data=EXCLUDED.time_series_data, avg_heart_rate=EXCLUDED.avg_heart_rate,
-                             max_heart_rate=EXCLUDED.max_heart_rate, avg_cadence=EXCLUDED.avg_cadence, total_calories=EXCLUDED.total_calories"
+                             max_heart_rate=EXCLUDED.max_heart_rate, avg_cadence=EXCLUDED.avg_cadence, total_calories=EXCLUDED.total_calories,
+                             strava_id=EXCLUDED.strava_id"
                         )
-                        .bind(user_id).bind(title).bind(start_time).bind(distance).bind(duration).bind(route_wkt).bind(ts_data).bind(avg_hr).bind(max_hr).bind(avg_cad).bind(calories)
+                        .bind(user_id).bind(title).bind(start_time).bind(distance).bind(duration).bind(route_wkt).bind(ts_data).bind(avg_hr).bind(max_hr).bind(avg_cad).bind(calories).bind(activity_id)
                         .execute(&db).await.ok();
                     }
                 }
@@ -691,7 +695,7 @@ async fn upload_run(State(state): State<AppState>, mut multipart: Multipart) -> 
 
     let final_title = title.unwrap_or_else(|| "Morning Run".to_string());
 
-    sqlx::query("INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, avg_cadence, total_calories) VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10, $11) ON CONFLICT (user_id, start_time) DO UPDATE SET title=EXCLUDED.title, distance_meters=EXCLUDED.distance_meters, duration_seconds=EXCLUDED.duration_seconds, route_line=EXCLUDED.route_line, time_series_data=EXCLUDED.time_series_data, avg_heart_rate=EXCLUDED.avg_heart_rate, max_heart_rate=EXCLUDED.max_heart_rate, avg_cadence=EXCLUDED.avg_cadence, total_calories=EXCLUDED.total_calories")
+    sqlx::query("INSERT INTO activities (user_id, title, start_time, distance_meters, duration_seconds, route_line, time_series_data, avg_heart_rate, max_heart_rate, avg_cadence, total_calories, strava_id) VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10, $11, NULL) ON CONFLICT (user_id, start_time) DO UPDATE SET title=EXCLUDED.title, distance_meters=EXCLUDED.distance_meters, duration_seconds=EXCLUDED.duration_seconds, route_line=EXCLUDED.route_line, time_series_data=EXCLUDED.time_series_data, avg_heart_rate=EXCLUDED.avg_heart_rate, max_heart_rate=EXCLUDED.max_heart_rate, avg_cadence=EXCLUDED.avg_cadence, total_calories=EXCLUDED.total_calories")
         .bind(user_id).bind(final_title).bind(start_time).bind(final_distance as i32).bind(final_duration).bind(wkt).bind(ts_json).bind(avg_hr).bind(max_hr).bind(avg_cad).bind(calories)
         .execute(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::CREATED)
@@ -705,7 +709,7 @@ async fn get_feed(State(state): State<AppState>, Query(query): Query<FeedQuery>)
     let activities = match query.user_id {
         Some(uid) => {
             sqlx::query_as::<_, ActivityFeedItem>(
-                r#"SELECT a.id, a.user_id, a.title, a.start_time, a.distance_meters, a.duration_seconds,
+                r#"SELECT a.id, a.user_id, a.strava_id, a.title, a.start_time, a.distance_meters, a.duration_seconds,
                    ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url,
                    a.avg_heart_rate, a.avg_cadence, a.total_calories,
                    (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count,
@@ -718,7 +722,7 @@ async fn get_feed(State(state): State<AppState>, Query(query): Query<FeedQuery>)
         },
         None => {
             sqlx::query_as::<_, ActivityFeedItem>(
-                r#"SELECT a.id, a.user_id, a.title, a.start_time, a.distance_meters, a.duration_seconds,
+                r#"SELECT a.id, a.user_id, a.strava_id, a.title, a.start_time, a.distance_meters, a.duration_seconds,
                    ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url,
                    a.avg_heart_rate, a.avg_cadence, a.total_calories,
                    (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count,
@@ -728,7 +732,8 @@ async fn get_feed(State(state): State<AppState>, Query(query): Query<FeedQuery>)
                    ORDER BY a.start_time DESC LIMIT $1 OFFSET $2"#
             ).bind(per_page).bind(offset).fetch_all(&db).await
         }
-    }.map_err(|e| {
+    }
+map_err(|e| {
         error!("Feed query failed: {:?}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
@@ -738,7 +743,7 @@ async fn get_feed(State(state): State<AppState>, Query(query): Query<FeedQuery>)
 
 async fn get_activity(State(state): State<AppState>, Path(id): Path<i32>) -> Result<Json<ActivityDetail>, (StatusCode, String)> {
     let db = state.get_db().await?;
-    let row = sqlx::query("SELECT a.id, a.user_id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, a.time_series_data, u.username, u.avatar_url, a.avg_heart_rate, a.max_heart_rate, a.avg_cadence, a.total_calories FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.id = $1").bind(id).fetch_optional(&db).await.map_err(|e| {
+    let row = sqlx::query("SELECT a.id, a.user_id, a.strava_id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, a.time_series_data, u.username, u.avatar_url, a.avg_heart_rate, a.max_heart_rate, a.avg_cadence, a.total_calories FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.id = $1").bind(id).fetch_optional(&db).await.map_err(|e| {
         error!("Get activity failed: {:?}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?.ok_or((StatusCode::NOT_FOUND, "Not found".to_string()))?;
@@ -748,18 +753,19 @@ async fn get_activity(State(state): State<AppState>, Path(id): Path<i32>) -> Res
     Ok(Json(ActivityDetail {
         id: row.get(0),
         user_id: row.get(1),
-        title: row.get(2),
-        start_time: row.get(3),
-        distance_meters: row.get(4),
-        duration_seconds: row.get(5),
-        route_line_geojson: row.get(6),
-        time_series_data: row.get(7),
-        username: row.get::<Option<String>, _>(8).unwrap_or_else(|| "Unknown".to_string()),
-        avatar_url: row.get(9),
-        avg_heart_rate: row.get(10),
-        max_heart_rate: row.get(11),
-        avg_cadence: row.get(12),
-        total_calories: row.get(13),
+        strava_id: row.get(2),
+        title: row.get(3),
+        start_time: row.get(4),
+        distance_meters: row.get(5),
+        duration_seconds: row.get(6),
+        route_line_geojson: row.get(7),
+        time_series_data: row.get(8),
+        username: row.get::<Option<String>, _>(9).unwrap_or_else(|| "Unknown".to_string()),
+        avatar_url: row.get(10),
+        avg_heart_rate: row.get(11),
+        max_heart_rate: row.get(12),
+        avg_cadence: row.get(13),
+        total_calories: row.get(14),
         comments
     }))
 }
@@ -778,7 +784,7 @@ async fn get_dashboard(State(state): State<AppState>, Path(user_id): Path<i32>) 
     let leaderboard = sqlx::query_as::<_, LeaderboardEntry>(r#"SELECT u.id as user_id, u.username, u.avatar_url, COALESCE(SUM(a.distance_meters), 0)::bigint as total_meters FROM users u JOIN activities a ON u.id = a.user_id WHERE a.start_time >= date_trunc('month', now()) GROUP BY u.id ORDER BY total_meters DESC LIMIT 10"#)
         .fetch_all(&db).await.unwrap_or_default();
 
-    let activities = sqlx::query_as::<_, ActivityFeedItem>(r#"SELECT a.id, a.user_id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.user_id = $1 ORDER BY a.start_time DESC"#)
+    let activities = sqlx::query_as::<_, ActivityFeedItem>(r#"SELECT a.id, a.user_id, a.strava_id, a.title, a.start_time, a.distance_meters, a.duration_seconds, ST_AsGeoJSON(a.route_line)::jsonb as route_line_geojson, u.username, u.avatar_url, a.avg_heart_rate, a.avg_cadence, a.total_calories, (SELECT COUNT(*) FROM activity_likes l WHERE l.activity_id = a.id) as like_count, (SELECT COUNT(*) FROM activity_comments c WHERE c.activity_id = a.id) as comment_count FROM activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.user_id = $1 ORDER BY a.start_time DESC"#)
         .bind(user_id)
         .fetch_all(&db).await.unwrap_or_default();
 
@@ -844,8 +850,8 @@ async fn sync_activity(State(state): State<AppState>, Json(payload): Json<Activi
     sqlx::query(
         r#"INSERT INTO activities
            (user_id, title, start_time, distance_meters, duration_seconds, route_line,
-            avg_heart_rate, max_heart_rate, avg_cadence, total_calories)
-           VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10)
+            avg_heart_rate, max_heart_rate, avg_cadence, total_calories, strava_id)
+           VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10, $11)
            ON CONFLICT (user_id, start_time) DO UPDATE SET
            title = EXCLUDED.title,
            distance_meters = EXCLUDED.distance_meters,
@@ -854,7 +860,8 @@ async fn sync_activity(State(state): State<AppState>, Json(payload): Json<Activi
            avg_heart_rate = EXCLUDED.avg_heart_rate,
            max_heart_rate = EXCLUDED.max_heart_rate,
            avg_cadence = EXCLUDED.avg_cadence,
-           total_calories = EXCLUDED.total_calories"#
+           total_calories = EXCLUDED.total_calories,
+           strava_id = EXCLUDED.strava_id"#
     )
     .bind(payload.user_id)
     .bind(&payload.title)
@@ -866,6 +873,7 @@ async fn sync_activity(State(state): State<AppState>, Json(payload): Json<Activi
     .bind(payload.max_heart_rate)
     .bind(payload.avg_cadence)
     .bind(payload.total_calories)
+    .bind(payload.strava_id)
     .execute(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::CREATED)

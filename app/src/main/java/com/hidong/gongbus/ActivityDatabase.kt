@@ -8,6 +8,7 @@ import com.google.gson.Gson
 data class ActivityEntity(
     @PrimaryKey val id: Int,
     val user_id: Int,
+    val strava_id: Long?,
     val title: String?,
     val start_time: String,
     val distance_meters: Int?,
@@ -25,6 +26,7 @@ data class ActivityEntity(
         return ActivityFeedItem(
             id = id,
             user_id = user_id,
+            strava_id = strava_id,
             title = title,
             start_time = start_time,
             distance_meters = distance_meters,
@@ -49,6 +51,7 @@ fun ActivityFeedItem.toEntity(gson: Gson): ActivityEntity {
     return ActivityEntity(
         id = id,
         user_id = user_id,
+        strava_id = strava_id,
         title = title,
         start_time = start_time,
         distance_meters = distance_meters,
@@ -82,7 +85,7 @@ interface ActivityDao {
     suspend fun deleteById(id: Int)
 }
 
-@Database(entities = [ActivityEntity::class], version = 1, exportSchema = false)
+@Database(entities = [ActivityEntity::class], version = 2, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun activityDao(): ActivityDao
 
@@ -96,7 +99,9 @@ abstract class AppDatabase : RoomDatabase() {
                     context.applicationContext,
                     AppDatabase::class.java,
                     "activity_database"
-                ).build()
+                )
+                .fallbackToDestructiveMigration()
+                .build()
                 INSTANCE = instance
                 instance
             }

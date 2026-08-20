@@ -74,6 +74,7 @@ import kotlin.math.roundToInt
 data class ActivityFeedItem(
     val id: Int,
     val user_id: Int,
+    val strava_id: Long?,
     val title: String?,
     val start_time: String,
     val distance_meters: Int?,
@@ -108,6 +109,7 @@ data class Comment(
 data class ActivityDetail(
     val id: Int,
     val user_id: Int = 0,
+    val strava_id: Long? = null,
     val title: String?,
     val start_time: String,
     val distance_meters: Int?,
