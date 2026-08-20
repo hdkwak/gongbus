@@ -168,7 +168,11 @@ data class LikePayload(val user_id: Int)
 // --- API ---
 interface RunningApi {
     @GET("feed")
-    suspend fun getFeed(@Query("user_id") userId: Int? = null): List<ActivityFeedItem>
+    suspend fun getFeed(
+        @Query("user_id") userId: Int? = null,
+        @Query("page") page: Int? = null,
+        @Query("per_page") perPage: Int? = null
+    ): List<ActivityFeedItem>
 
     @GET("activities/{id}")
     suspend fun getActivity(@Path("id") id: Int): ActivityDetail
@@ -263,6 +267,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var filterUserId by mutableStateOf<Int?>(null)
     var filterUsername by mutableStateOf<String?>(null)
     
+    var currentPage by mutableStateOf(1)
+    var hasMore by mutableStateOf(true)
+    
     var isFeedLoading by mutableStateOf(false)
     var isDetailLoading by mutableStateOf(false)
     var isDashboardLoading by mutableStateOf(false)
@@ -297,16 +304,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         activities = entities.map { it.toModel(gson) }
     }
 
-    fun fetchFeed() {
+    fun fetchFeed(loadMore: Boolean = false) {
+        if (loadMore && !hasMore) return
+        if (loadMore && isFeedLoading) return
+
         viewModelScope.launch {
             isFeedLoading = true
+            if (!loadMore) {
+                currentPage = 1
+                hasMore = true
+            }
+
             try { 
                 val currentFilter = filterUserId
-                val networkActivities = api.getFeed(currentFilter)
+                val networkActivities = api.getFeed(currentFilter, page = currentPage, perPage = 30)
                 
-                // Save to local cache (Upsert)
-                withContext(Dispatchers.IO) {
-                    activityDao.insertAll(networkActivities.map { it.toEntity(gson) })
+                if (networkActivities.isEmpty()) {
+                    hasMore = false
+                } else {
+                    // Save to local cache (Upsert)
+                    withContext(Dispatchers.IO) {
+                        activityDao.insertAll(networkActivities.map { it.toEntity(gson) })
+                    }
+                    
+                    if (loadMore) {
+                        currentPage++
+                    }
                 }
                 
                 // Reload from local to ensure UI is in sync with cache
@@ -321,6 +344,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setFeedFilter(userId: Int?, username: String?) {
         filterUserId = userId
         filterUsername = username
+        currentPage = 1
+        hasMore = true
         viewModelScope.launch {
             loadLocalActivities()
             fetchFeed()
@@ -859,6 +884,20 @@ fun FeedScreen(viewModel: MainViewModel, onActivityClick: (Int) -> Unit, onDelet
                     onUserClick = { id, name -> viewModel.setFeedFilter(id, name) },
                     onEditTitle = { activityForTitleEdit = activity }
                 ) 
+            }
+
+            if (viewModel.hasMore && viewModel.activities.isNotEmpty()) {
+                item {
+                    Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
+                        if (viewModel.isFeedLoading) {
+                            CircularProgressIndicator(Modifier.size(24.dp))
+                        } else {
+                            TextButton(onClick = { viewModel.fetchFeed(loadMore = true) }) {
+                                Text("Load More")
+                            }
+                        }
+                    }
+                }
             }
         }
         FloatingActionButton(onClick = { launcher.launch("*/*") }, modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)) { Icon(Icons.Default.Add, null) }

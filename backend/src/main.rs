@@ -703,7 +703,7 @@ async fn upload_run(State(state): State<AppState>, mut multipart: Multipart) -> 
 
 async fn get_feed(State(state): State<AppState>, Query(query): Query<FeedQuery>) -> Result<Json<Vec<ActivityFeedItem>>, (StatusCode, String)> {
     let db = state.get_db().await?;
-    let per_page = query.per_page.unwrap_or(20) as i64;
+    let per_page = query.per_page.unwrap_or(50) as i64;
     let offset = (query.page.unwrap_or(1) as i64 - 1) * per_page;
 
     let activities = match query.user_id {
