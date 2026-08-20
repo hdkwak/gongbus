@@ -11,7 +11,7 @@ use sqlx::{FromRow, Row, ConnectOptions};
 use std::io::Cursor;
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
-use tracing::{info, error, warn};
+use tracing::{info, error};
 use futures_util::StreamExt;
 use reqwest::multipart as req_multipart;
 use sha1::{Sha1, Digest};
@@ -732,8 +732,7 @@ async fn get_feed(State(state): State<AppState>, Query(query): Query<FeedQuery>)
                    ORDER BY a.start_time DESC LIMIT $1 OFFSET $2"#
             ).bind(per_page).bind(offset).fetch_all(&db).await
         }
-    }
-map_err(|e| {
+    }.map_err(|e| {
         error!("Feed query failed: {:?}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
