@@ -145,6 +145,20 @@ struct UserProfile {
     target_race: Option<String>,
     race_date: Option<chrono::NaiveDate>,
     strava_athlete_id: Option<i64>,
+    ai_provider: Option<String>,
+    ai_api_key: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ChatMessage {
+    role: String,
+    message: String,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Deserialize)]
+struct ChatRequest {
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -203,6 +217,7 @@ async fn main() {
         .route("/users/:id", get(get_user_profile).put(update_user_profile))
         .route("/users/:id/strava-link", post(get_strava_link))
         .route("/users/:id/strava-sync", post(trigger_strava_sync))
+        .route("/activities/:id/chat", get(get_chat_history).post(ask_ai_coach))
         .route("/strava/callback", get(strava_callback))
         .route("/upload-run", post(upload_run))
         .route("/upload-avatar", post(upload_avatar))
@@ -230,14 +245,14 @@ async fn create_user(State(state): State<AppState>, Json(payload): Json<UserProf
 
 async fn get_users(State(state): State<AppState>) -> Result<Json<Vec<UserProfile>>, (StatusCode, String)> {
     let db = state.get_db().await?;
-    let users = sqlx::query_as::<_, UserProfile>("SELECT id, username, avatar_url, marathon_goal_sec, weekly_target_km, monthly_target_km, target_lsd_count, target_race, race_date, strava_athlete_id FROM users ORDER BY id DESC")
+    let users = sqlx::query_as::<_, UserProfile>("SELECT id, username, avatar_url, marathon_goal_sec, weekly_target_km, monthly_target_km, target_lsd_count, target_race, race_date, strava_athlete_id, ai_provider, ai_api_key FROM users ORDER BY id DESC")
         .fetch_all(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(users))
 }
 
 async fn get_user_profile(State(state): State<AppState>, Path(id): Path<i32>) -> Result<Json<UserProfile>, (StatusCode, String)> {
     let db = state.get_db().await?;
-    let user = sqlx::query_as::<_, UserProfile>("SELECT id, username, avatar_url, marathon_goal_sec, weekly_target_km, monthly_target_km, target_lsd_count, target_race, race_date, strava_athlete_id FROM users WHERE id = $1")
+    let user = sqlx::query_as::<_, UserProfile>("SELECT id, username, avatar_url, marathon_goal_sec, weekly_target_km, monthly_target_km, target_lsd_count, target_race, race_date, strava_athlete_id, ai_provider, ai_api_key FROM users WHERE id = $1")
         .bind(id)
         .fetch_optional(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "User not found".to_string()))?;
@@ -246,8 +261,8 @@ async fn get_user_profile(State(state): State<AppState>, Path(id): Path<i32>) ->
 
 async fn update_user_profile(State(state): State<AppState>, Path(id): Path<i32>, Json(payload): Json<UserProfile>) -> Result<StatusCode, (StatusCode, String)> {
     let db = state.get_db().await?;
-    sqlx::query("UPDATE users SET username = $1, avatar_url = $2, marathon_goal_sec = $3, weekly_target_km = $4, monthly_target_km = $5, target_lsd_count = $6, target_race = $7, race_date = $8, strava_athlete_id = $9 WHERE id = $10")
-        .bind(payload.username).bind(payload.avatar_url).bind(payload.marathon_goal_sec).bind(payload.weekly_target_km).bind(payload.monthly_target_km).bind(payload.target_lsd_count).bind(&payload.target_race).bind(payload.race_date).bind(payload.strava_athlete_id).bind(id)
+    sqlx::query("UPDATE users SET username = $1, avatar_url = $2, marathon_goal_sec = $3, weekly_target_km = $4, monthly_target_km = $5, target_lsd_count = $6, target_race = $7, race_date = $8, strava_athlete_id = $9, ai_provider = $10, ai_api_key = $11 WHERE id = $12")
+        .bind(payload.username).bind(payload.avatar_url).bind(payload.marathon_goal_sec).bind(payload.weekly_target_km).bind(payload.monthly_target_km).bind(payload.target_lsd_count).bind(&payload.target_race).bind(payload.race_date).bind(payload.strava_athlete_id).bind(payload.ai_provider).bind(payload.ai_api_key).bind(id)
         .execute(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::OK)
 }
@@ -828,52 +843,63 @@ async fn update_activity(State(state): State<AppState>, Path(id): Path<i32>, Jso
     Ok(StatusCode::OK)
 }
 
-async fn sync_activity(State(state): State<AppState>, Json(payload): Json<ActivityDetail>) -> Result<StatusCode, (StatusCode, String)> {
+async fn get_chat_history(State(state): State<AppState>, Path(activity_id): Path<i32>) -> Result<Json<Vec<ChatMessage>>, (StatusCode, String)> {
+    let db = state.get_db().await?;
+    let history = sqlx::query_as!(ChatMessage, "SELECT role, message, created_at FROM activity_chats WHERE activity_id = $1 ORDER BY created_at ASC", activity_id)
+        .fetch_all(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(history))
+}
+
+async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32>, Json(payload): Json<ChatRequest>) -> Result<Json<ChatMessage>, (StatusCode, String)> {
     let db = state.get_db().await?;
 
-    // Convert GeoJSON to WKT for PostGIS if provided
-    let route_wkt = if let Some(geojson) = payload.route_line_geojson {
-        // Simple conversion for LineString
-        let coords = geojson.get("coordinates").and_then(|c| c.as_array());
-        if let Some(arr) = coords {
-            let points: Vec<String> = arr.iter().filter_map(|p| {
-                let p_arr = p.as_array()?;
-                Some(format!("{} {}", p_arr[0], p_arr[1]))
-            }).collect();
-            if points.len() >= 2 {
-                Some(format!("LINESTRING({})", points.join(",")))
-            } else { None }
-        } else { None }
-    } else { None };
+    // 1. Get Activity & User Context
+    let activity = sqlx::query!("SELECT a.*, u.username, u.marathon_goal_sec, u.target_race, u.race_date, u.ai_provider, u.ai_api_key FROM activities a JOIN users u ON a.user_id = u.id WHERE a.id = $1", activity_id)
+        .fetch_one(&db).await.map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    sqlx::query(
-        r#"INSERT INTO activities
-           (user_id, title, start_time, distance_meters, duration_seconds, route_line,
-            avg_heart_rate, max_heart_rate, avg_cadence, total_calories, strava_id)
-           VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10, $11)
-           ON CONFLICT (user_id, start_time) DO UPDATE SET
-           title = EXCLUDED.title,
-           distance_meters = EXCLUDED.distance_meters,
-           duration_seconds = EXCLUDED.duration_seconds,
-           route_line = EXCLUDED.route_line,
-           avg_heart_rate = EXCLUDED.avg_heart_rate,
-           max_heart_rate = EXCLUDED.max_heart_rate,
-           avg_cadence = EXCLUDED.avg_cadence,
-           total_calories = EXCLUDED.total_calories,
-           strava_id = EXCLUDED.strava_id"#
-    )
-    .bind(payload.user_id)
-    .bind(&payload.title)
-    .bind(payload.start_time)
-    .bind(payload.distance_meters)
-    .bind(payload.duration_seconds)
-    .bind(route_wkt)
-    .bind(payload.avg_heart_rate)
-    .bind(payload.max_heart_rate)
-    .bind(payload.avg_cadence)
-    .bind(payload.total_calories)
-    .bind(payload.strava_id)
-    .execute(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let api_key = activity.ai_api_key.ok_or((StatusCode::BAD_REQUEST, "No AI API Key found in profile".to_string()))?;
+    let provider = activity.ai_provider.unwrap_or_else(|| "openai".to_string());
 
-    Ok(StatusCode::CREATED)
+    // 2. Build Contextual Prompt
+    let goal_time = activity.marathon_goal_sec.map(|s| format!("{}h {}m", s/3600, (s%3600)/60)).unwrap_or_else(|| "N/A".to_string());
+    let dist_km = activity.distance_meters.unwrap_or(0) as f64 / 1000.0;
+    let duration = format!("{} min", activity.duration_seconds.unwrap_or(0) / 60);
+
+    let context_prompt = format!(
+        "You are a professional running coach for {}.
+        User's Goal: {} in {} marathon.
+        Race Date: {}.
+        Latest Run: {} km, Duration: {}, Avg HR: {:?}, Avg Cadence: {:?}.
+        Analyze this run and provide actionable, motivating feedback.",
+        activity.username, goal_time, activity.target_race.unwrap_or_default(), activity.race_date.map(|d| d.to_string()).unwrap_or_default(),
+        dist_km, duration, activity.avg_heart_rate, activity.avg_cadence
+    );
+
+    // 3. Call AI Provider
+    let ai_response = if provider == "openai" {
+        let client = reqwest::Client::new();
+        let resp = client.post("https://api.openai.com/v1/chat/completions")
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [
+                    {"role": "system", "content": context_prompt},
+                    {"role": "user", "content": payload.message}
+                ]
+            }))
+            .send().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        json["choices"][0]["message"]["content"].as_str().unwrap_or("Error calling AI").to_string()
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "Unsupported AI provider".to_string()));
+    };
+
+    // 4. Save to Database
+    sqlx::query!("INSERT INTO activity_chats (activity_id, user_id, role, message) VALUES ($1, $2, $3, $4)",
+        activity_id, activity.user_id, "user", payload.message).execute(&db).await.ok();
+    sqlx::query!("INSERT INTO activity_chats (activity_id, user_id, role, message) VALUES ($1, $2, $3, $4)",
+        activity_id, activity.user_id, "assistant", ai_response).execute(&db).await.ok();
+
+    Ok(Json(ChatMessage { role: "assistant".to_string(), message: ai_response, created_at: Some(chrono::Utc::now()) }))
 }

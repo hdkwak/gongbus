@@ -155,8 +155,18 @@ data class UserProfile(
     val target_lsd_count: Int?,
     val target_race: String?,
     val race_date: String?,
-    val strava_athlete_id: Long? = null
+    val strava_athlete_id: Long? = null,
+    val ai_provider: String? = "openai",
+    val ai_api_key: String? = null
 )
+
+data class ChatMessage(
+    val role: String,
+    val message: String,
+    val created_at: String? = null
+)
+
+data class ChatRequest(val message: String)
 
 data class StravaLinkResponse(val url: String)
 
@@ -217,6 +227,12 @@ interface RunningApi {
     @POST("activities")
     suspend fun syncActivity(@Body activity: ActivityDetail): retrofit2.Response<Unit>
 
+    @GET("activities/{id}/chat")
+    suspend fun getChatHistory(@Path("id") id: Int): List<ChatMessage>
+
+    @POST("activities/{id}/chat")
+    suspend fun askAiCoach(@Path("id") id: Int, @Body payload: ChatRequest): ChatMessage
+
     @Multipart
     @POST("upload-run")
     suspend fun uploadRun(
@@ -276,7 +292,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var isProfileLoading by mutableStateOf(false)
     var isMembersLoading by mutableStateOf(false)
     var isUploading by mutableStateOf(false)
+    var isChatLoading by mutableStateOf(false)
     var uploadStatus = mutableStateOf<String?>(null)
+    
+    var chatHistory by mutableStateOf<List<ChatMessage>>(emptyList())
 
     init { 
         val savedId = prefs.getInt("user_id", -1)
@@ -310,14 +329,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             isFeedLoading = true
-            if (!loadMore) {
-                currentPage = 1
-                hasMore = true
-            }
+            val pageToFetch = if (loadMore) currentPage else 1
+            val pageSize = 30
 
             try { 
                 val currentFilter = filterUserId
-                val networkActivities = api.getFeed(currentFilter, page = currentPage, perPage = 30)
+                val networkActivities = api.getFeed(currentFilter, page = pageToFetch, perPage = pageSize)
                 
                 if (networkActivities.isEmpty()) {
                     hasMore = false
@@ -327,8 +344,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         activityDao.insertAll(networkActivities.map { it.toEntity(gson) })
                     }
                     
-                    if (loadMore) {
-                        currentPage++
+                    // If we got fewer items than requested, there are no more pages
+                    if (networkActivities.size < pageSize) {
+                        hasMore = false
+                    } else {
+                        currentPage = pageToFetch + 1
+                        hasMore = true
                     }
                 }
                 
@@ -575,10 +596,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             selectedActivity = null
             isDetailLoading = true
             try { 
-                selectedActivity = api.getActivity(id) 
+                selectedActivity = api.getActivity(id)
+                chatHistory = api.getChatHistory(id)
             } catch (e: Exception) { 
                 uploadStatus.value = "Error: ${e.message}"
             } finally { isDetailLoading = false }
+        }
+    }
+
+    fun sendMessageToCoach(activityId: Int, message: String) {
+        viewModelScope.launch {
+            isChatLoading = true
+            // Local echo
+            chatHistory = chatHistory + ChatMessage("user", message)
+            try {
+                val response = api.askAiCoach(activityId, ChatRequest(message))
+                chatHistory = chatHistory + response
+            } catch (e: Exception) {
+                uploadStatus.value = "Coach error: ${e.message}"
+            } finally {
+                isChatLoading = false
+            }
         }
     }
 
@@ -991,7 +1029,7 @@ fun ActivityCard(
                 Spacer(Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     SummaryStat("Avg HR", (activity.avg_heart_rate ?: "--").toString())
-                    SummaryStat("Avg Cad", (activity.avg_cadence ?: "--").toString())
+                    SummaryStat("Avg Cad", activity.avg_cadence?.let { if (it < 120) it * 2 else it }?.toString() ?: "--")
                     SummaryStat("Calories", (activity.total_calories ?: "--").toString())
                     val distKm = (activity.distance_meters ?: 0) / 1000.0
                     SummaryStat("Dist", "%.1f km".format(distKm))
@@ -1373,17 +1411,34 @@ fun ProfileScreen(viewModel: MainViewModel) {
                 )
             )
 
+            Spacer(Modifier.height(8.dp))
+            Text("AI Coach Settings", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.align(Alignment.Start))
+            
+            var aiProvider by remember { mutableStateOf(profile.ai_provider ?: "openai") }
+            var aiApiKey by remember { mutableStateOf(profile.ai_api_key ?: "") }
+
+            OutlinedTextField(
+                value = aiApiKey,
+                onValueChange = { aiApiKey = it },
+                label = { Text("OpenAI API Key") },
+                modifier = Modifier.fillMaxWidth(),
+                placeholder = { Text("sk-...") },
+                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation()
+            )
+
             Button(
                 onClick = {
                     val updated = profile.copy(
                         username = username,
-                        avatar_url = avatarUrl, // Will be updated if localAvatarUri is present
+                        avatar_url = avatarUrl,
                         marathon_goal_sec = parseHHMMSSToSeconds(goalTimeStr),
                         weekly_target_km = weeklyTarget.toDoubleOrNull(),
                         monthly_target_km = monthlyTarget.toDoubleOrNull(),
                         target_lsd_count = targetLsd.toIntOrNull(),
                         target_race = targetRace.takeIf { it.isNotEmpty() },
-                        race_date = raceDate.takeIf { it.isNotEmpty() }
+                        race_date = raceDate.takeIf { it.isNotEmpty() },
+                        ai_provider = aiProvider,
+                        ai_api_key = aiApiKey.takeIf { it.isNotEmpty() }
                     )
                     viewModel.saveProfile(context, updated, localAvatarUri)
                 },
@@ -1479,6 +1534,96 @@ fun MembersScreen(viewModel: MainViewModel, onUserSelected: () -> Unit) {
     }
 }
 
+@Composable
+fun CoachChatDialog(viewModel: MainViewModel, activityId: Int, onDismiss: () -> Unit) {
+    var messageText by remember { mutableStateOf("") }
+    val history = viewModel.chatHistory
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { 
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.SmartToy, null, tint = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.width(8.dp))
+                Text("Coach Analysis")
+            }
+        },
+        text = {
+            Column(Modifier.fillMaxWidth()) {
+                LazyColumn(
+                    modifier = Modifier
+                        .heightIn(max = 400.dp)
+                        .fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    contentPadding = PaddingValues(vertical = 8.dp)
+                ) {
+                    if (history.isEmpty()) {
+                        item {
+                            Text(
+                                "Ask me anything about this run! I know your goals and your performance data.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color.Gray
+                            )
+                        }
+                    }
+                    items(history) { msg ->
+                        val isCoach = msg.role == "assistant"
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalAlignment = if (isCoach) Alignment.Start else Alignment.End
+                        ) {
+                            Surface(
+                                color = if (isCoach) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.primaryContainer,
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text(
+                                    msg.message,
+                                    modifier = Modifier.padding(12.dp),
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                            }
+                        }
+                    }
+                    if (viewModel.isChatLoading) {
+                        item {
+                            CircularProgressIndicator(
+                                Modifier
+                                    .size(24.dp)
+                                    .align(Alignment.Start)
+                                    .padding(4.dp)
+                            )
+                        }
+                    }
+                }
+                
+                Spacer(Modifier.height(16.dp))
+                OutlinedTextField(
+                    value = messageText,
+                    onValueChange = { messageText = it },
+                    placeholder = { Text("How was my heart rate?") },
+                    modifier = Modifier.fillMaxWidth(),
+                    trailingIcon = {
+                        IconButton(
+                            onClick = {
+                                if (messageText.isNotEmpty()) {
+                                    viewModel.sendMessageToCoach(activityId, messageText)
+                                    messageText = ""
+                                }
+                            },
+                            enabled = !viewModel.isChatLoading && messageText.isNotEmpty()
+                        ) {
+                            Icon(Icons.Default.Send, null)
+                        }
+                    }
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        }
+    )
+}
+
 fun formatSecondsToHHMMSS(totalSeconds: Int?): String {
     if (totalSeconds == null || totalSeconds <= 0) return ""
     val h = totalSeconds / 3600
@@ -1509,6 +1654,11 @@ fun ActivityDetailScreen(viewModel: MainViewModel, onBack: () -> Unit) {
     val activity = viewModel.selectedActivity
     var lapDistanceKm by remember { mutableStateOf(1.0f) }
     var showEditTitleDialog by remember { mutableStateOf(false) }
+    var showChatCoach by remember { mutableStateOf(false) }
+
+    if (showChatCoach && activity != null) {
+        CoachChatDialog(viewModel, activity.id) { showChatCoach = false }
+    }
 
     if (showEditTitleDialog && activity != null) {
         var newTitle by remember { mutableStateOf(activity.title ?: "") }
@@ -1549,6 +1699,16 @@ fun ActivityDetailScreen(viewModel: MainViewModel, onBack: () -> Unit) {
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primary)
             )
+        },
+        floatingActionButton = {
+            if (activity != null) {
+                ExtendedFloatingActionButton(
+                    onClick = { showChatCoach = true },
+                    icon = { Icon(Icons.Default.SmartToy, null) },
+                    text = { Text("Ask Coach") },
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                )
+            }
         }
     ) { padding ->
         if (viewModel.isDetailLoading) {
@@ -1559,7 +1719,7 @@ fun ActivityDetailScreen(viewModel: MainViewModel, onBack: () -> Unit) {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     SummaryStat("Avg HR", (activity.avg_heart_rate ?: "--").toString())
                     SummaryStat("Max HR", (activity.max_heart_rate ?: "--").toString())
-                    SummaryStat("Avg Cad", (activity.avg_cadence ?: "--").toString())
+                    SummaryStat("Avg Cad", activity.avg_cadence?.let { if (it < 120) it * 2 else it }?.toString() ?: "--")
                     SummaryStat("Calories", (activity.total_calories ?: "--").toString())
                 }
                 Column {
@@ -1570,13 +1730,19 @@ fun ActivityDetailScreen(viewModel: MainViewModel, onBack: () -> Unit) {
                         }
                     }
                 }
-                val splits = remember(activity.time_series_data, lapDistanceKm) { calculateSplits(activity.time_series_data ?: emptyList(), lapDistanceKm) }
+                val splits = remember(activity.time_series_data, lapDistanceKm) { 
+                    calculateSplits(activity.time_series_data ?: emptyList(), lapDistanceKm).map { split ->
+                        split.copy(avgCadence = split.avgCadence?.let { if (it < 120) it * 2 else it })
+                    }
+                }
                 MetricChart("Heart Rate (bpm)", splits.map { it.avgHeartRate })
                 MetricChart("Pace (min/km)", splits.map { it.avgPace }, inverted = true, isPace = true)
                 MetricChart("Cadence (spm)", splits.map { it.avgCadence })
                 MetricChart("Elevation (m)", splits.map { it.avgAltitude })
                 MetricChart("Stride Distance (m)", splits.map { it.avgStrideDistance })
                 MetricChart("Ground Contact Time (ms)", splits.map { it.avgGct })
+                
+                Spacer(Modifier.height(80.dp)) // room for FAB
             }
         } else {
             Box(Modifier.fillMaxSize().padding(padding), Alignment.Center) {
@@ -1632,32 +1798,89 @@ fun SummaryStat(label: String, value: String) {
 @Composable
 fun MetricChart(title: String, data: List<Float?>?, inverted: Boolean = false, isPace: Boolean = false) {
     val vals = data?.filterNotNull() ?: emptyList()
+    var selectedIndex by remember { mutableStateOf<Int?>(null) }
+
     Column {
-        Text(title, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text(title, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            if (selectedIndex != null && selectedIndex!! < vals.size) {
+                val v = vals[selectedIndex!!]
+                val formatValue: (Float) -> String = { valF ->
+                    if (isPace) { val ts = (valF * 60).roundToInt(); "%d:%02d".format(ts / 60, ts % 60) }
+                    else "%.1f".format(valF)
+                }
+                Surface(
+                    color = MaterialTheme.colorScheme.primary,
+                    shape = RoundedCornerShape(4.dp)
+                ) {
+                    Text(
+                        "Lap ${selectedIndex!! + 1}: ${formatValue(v)}",
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = Color.White
+                    )
+                }
+            }
+        }
+        
         Spacer(Modifier.height(8.dp))
-        if (vals.isEmpty()) Text("No data")
-        else {
-            val sampled = if (vals.size > 40) { val s = vals.size / 40; vals.filterIndexed { i, _ -> i % s == 0 } } else vals
-            val max = sampled.maxOrNull() ?: 1f
-            val min = sampled.minOrNull() ?: 0f
+        
+        if (vals.isEmpty()) {
+            Text("No data", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+        } else {
+            val max = vals.maxOrNull() ?: 1f
+            val min = vals.minOrNull() ?: 0f
             val avg = vals.average().toFloat()
             val range = if (max == min) 1f else max - min
-            val formatValue: (Float) -> String = { v ->
+            
+            val formatLabel: (Float) -> String = { v ->
                 if (isPace) { val ts = (v * 60).roundToInt(); "%d:%02d".format(ts / 60, ts % 60) }
-                else "%.1f".format(v)
+                else v.roundToInt().toString()
             }
-            Row(Modifier.fillMaxWidth().height(130.dp).background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp)).padding(8.dp), verticalAlignment = Alignment.Bottom) {
-                Column(Modifier.fillMaxHeight(), Arrangement.SpaceBetween, Alignment.End) {
-                    Text(formatValue(if (inverted) min else max), style = MaterialTheme.typography.labelSmall, fontSize = 9.sp)
-                    Text(formatValue(avg), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary, fontSize = 9.sp)
-                    Text(formatValue(if (inverted) max else min), style = MaterialTheme.typography.labelSmall, fontSize = 9.sp)
+
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .height(140.dp)
+                    .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp))
+                    .padding(8.dp),
+                verticalAlignment = Alignment.Bottom
+            ) {
+                // Y-Axis Labels
+                Column(Modifier.fillMaxHeight().width(35.dp), Arrangement.SpaceBetween, Alignment.End) {
+                    Text(formatLabel(if (inverted) min else max), style = MaterialTheme.typography.labelSmall, fontSize = 9.sp)
+                    Text(formatLabel(avg), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary, fontSize = 9.sp)
+                    Text(formatLabel(if (inverted) max else min), style = MaterialTheme.typography.labelSmall, fontSize = 9.sp)
                 }
+                
                 Spacer(Modifier.width(8.dp))
+                
+                // Chart Area
                 Column(Modifier.weight(1f).fillMaxHeight()) {
-                    Row(Modifier.weight(1f).fillMaxWidth(), Arrangement.spacedBy(2.dp), Alignment.Bottom) {
-                        sampled.forEach { v -> Box(Modifier.weight(1f).fillMaxHeight((if (inverted) (max - v) / range else (v - min) / range).coerceIn(0.05f, 1f)).background(MaterialTheme.colorScheme.primary, RoundedCornerShape(1.dp))) }
+                    Row(
+                        Modifier.weight(1f).fillMaxWidth(),
+                        Arrangement.spacedBy(2.dp),
+                        Alignment.Bottom
+                    ) {
+                        vals.forEachIndexed { index, v ->
+                            val isSelected = selectedIndex == index
+                            Box(
+                                Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight((if (inverted) (max - v) / range else (v - min) / range).coerceIn(0.05f, 1f))
+                                    .background(
+                                        if (isSelected) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.primary,
+                                        RoundedCornerShape(topStart = 2.dp, topEnd = 2.dp)
+                                    )
+                                    .clickable { 
+                                        selectedIndex = if (selectedIndex == index) null else index
+                                    }
+                            )
+                        }
                     }
-                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { Text("Distance (Laps)", style = MaterialTheme.typography.labelSmall, fontSize = 8.sp, color = Color.Gray) }
+                    Box(Modifier.fillMaxWidth().padding(top = 4.dp), contentAlignment = Alignment.Center) {
+                        Text("Lap Distance", style = MaterialTheme.typography.labelSmall, fontSize = 8.sp, color = Color.Gray)
+                    }
                 }
             }
         }
