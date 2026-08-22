@@ -975,34 +975,49 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
         json["choices"][0]["message"]["content"].as_str().unwrap_or("Error calling AI").to_string()
     } else if provider == "gemini" {
         let client = reqwest::Client::new();
-        let url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}", api_key);
+        // Switched to v1 stable API
+        let url = format!("https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={}", api_key);
         let combined_prompt = format!("System Instruction: {}\n\nUser Question: {}", context_prompt, payload.message);
+
+        info!("Calling Gemini API for user {}...", row.get::<String, _>("username"));
+
         let resp = client.post(url)
             .json(&serde_json::json!({
                 "contents": [{
                     "parts": [{"text": combined_prompt}]
-                }]
+                }],
+                "generationConfig": {
+                    "temperature": 0.7,
+                    "maxOutputTokens": 1024,
+                }
             }))
             .send().await.map_err(|e| {
-                error!("Gemini connection error: {}", e);
+                error!("Gemini network connection failed: {}", e);
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("Gemini connection error: {}", e))
             })?;
 
-        if !resp.status().is_success() {
-            let err_json: serde_json::Value = resp.json().await.unwrap_or_default();
-            let err_msg = err_json["error"]["message"].as_str().unwrap_or("Unknown Gemini error");
-            return Err((StatusCode::BAD_GATEWAY, err_msg.to_string()));
+        let status = resp.status();
+        if !status.is_success() {
+            let err_text = resp.text().await.unwrap_or_default();
+            error!("Gemini API returned error ({}): {}", status, err_text);
+
+            // Try to parse the specific error message from Google's JSON
+            let err_json: serde_json::Value = serde_json::from_str(&err_text).unwrap_or_default();
+            let specific_msg = err_json["error"]["message"].as_str()
+                .unwrap_or("Gemini API is currently unavailable or your key is invalid.");
+
+            return Err((StatusCode::BAD_GATEWAY, specific_msg.to_string()));
         }
 
         let json: serde_json::Value = resp.json().await.map_err(|e| {
-            error!("Failed to parse Gemini response: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to parse AI response".to_string())
+            error!("Failed to parse Gemini JSON response: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Invalid response from AI provider".to_string())
         })?;
 
         json["candidates"][0]["content"]["parts"][0]["text"].as_str()
             .ok_or_else(|| {
-                error!("Unexpected Gemini response structure: {:?}", json);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Invalid AI response structure".to_string())
+                error!("Gemini response missing text part. Full response: {:?}", json);
+                (StatusCode::INTERNAL_SERVER_ERROR, "AI coach failed to generate a text response".to_string())
             })?.to_string()
     } else if provider == "claude" {
         let client = reqwest::Client::new();
