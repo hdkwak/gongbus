@@ -197,16 +197,23 @@ async fn main() {
     let opt = opt.disable_statement_logging()
         .statement_cache_capacity(0);
 
+    info!("Connecting to database...");
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .acquire_timeout(std::time::Duration::from_secs(30))
+        .acquire_timeout(std::time::Duration::from_secs(10))
         .connect_with(opt)
         .await
+        .map_err(|e| {
+            error!("Database connection failed: {}", e);
+            e
+        })
         .expect("Failed to create database pool");
+    info!("Database connection established.");
 
     let state = AppState { db: pool, cloudinary_config, strava_config };
 
     let app = Router::new()
+        .route("/health", get(|| async { "OK" }))
         .route("/feed", get(get_feed))
         .route("/activities", post(sync_activity))
         .route("/activities/:id", get(get_activity).put(update_activity).delete(delete_activity))
@@ -228,9 +235,10 @@ async fn main() {
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("Server starting on {}", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    info!("Attempting to bind to {}", addr);
+    let listener = tokio::net::TcpListener::bind(addr).await.expect("Failed to bind to port");
+    info!("Server listening on {}", addr);
+    axum::serve(listener, app).await.expect("Failed to start server");
 }
 
 async fn create_user(State(state): State<AppState>, Json(payload): Json<UserProfile>) -> Result<Json<UserProfile>, (StatusCode, String)> {
