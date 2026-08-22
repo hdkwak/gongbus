@@ -1417,12 +1417,36 @@ fun ProfileScreen(viewModel: MainViewModel) {
             var aiProvider by remember { mutableStateOf(profile.ai_provider ?: "openai") }
             var aiApiKey by remember { mutableStateOf(profile.ai_api_key ?: "") }
 
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Select AI Provider", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("openai" to "OpenAI", "gemini" to "Gemini", "claude" to "Claude").forEach { (id, label) ->
+                        FilterChip(
+                            selected = aiProvider == id,
+                            onClick = { aiProvider = id },
+                            label = { Text(label) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+
             OutlinedTextField(
                 value = aiApiKey,
                 onValueChange = { aiApiKey = it },
-                label = { Text("OpenAI API Key") },
+                label = { Text(when(aiProvider) {
+                    "openai" -> "OpenAI API Key"
+                    "gemini" -> "Gemini API Key"
+                    "claude" -> "Claude API Key"
+                    else -> "API Key"
+                }) },
                 modifier = Modifier.fillMaxWidth(),
-                placeholder = { Text("sk-...") },
+                placeholder = { Text(when(aiProvider) {
+                    "openai" -> "sk-..."
+                    "gemini" -> "AIza..."
+                    "claude" -> "sk-ant-..."
+                    else -> ""
+                }) },
                 visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation()
             )
 

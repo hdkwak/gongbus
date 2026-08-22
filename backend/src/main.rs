@@ -891,6 +891,37 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
 
         let json: serde_json::Value = resp.json().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         json["choices"][0]["message"]["content"].as_str().unwrap_or("Error calling AI").to_string()
+    } else if provider == "gemini" {
+        let client = reqwest::Client::new();
+        let url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}", api_key);
+        let combined_prompt = format!("{}\n\nUser Question: {}", context_prompt, payload.message);
+        let resp = client.post(url)
+            .json(&serde_json::json!({
+                "contents": [{
+                    "parts": [{"text": combined_prompt}]
+                }]
+            }))
+            .send().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        json["candidates"][0]["content"]["parts"][0]["text"].as_str().unwrap_or("Error calling Gemini").to_string()
+    } else if provider == "claude" {
+        let client = reqwest::Client::new();
+        let resp = client.post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&serde_json::json!({
+                "model": "claude-3-5-sonnet-20240620",
+                "max_tokens": 1024,
+                "system": context_prompt,
+                "messages": [
+                    {"role": "user", "content": payload.message}
+                ]
+            }))
+            .send().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        json["content"][0]["text"].as_str().unwrap_or("Error calling Claude").to_string()
     } else {
         return Err((StatusCode::BAD_REQUEST, "Unsupported AI provider".to_string()));
     };
