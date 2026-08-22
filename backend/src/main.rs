@@ -21,6 +21,7 @@ struct AppState {
     db: PgPool,
     cloudinary_config: CloudinaryConfig,
     strava_config: StravaConfig,
+    gemini_model: String,
 }
 
 impl AppState {
@@ -193,6 +194,8 @@ async fn main() {
         webhook_verify_token: std::env::var("STRAVA_WEBHOOK_VERIFY_TOKEN").unwrap_or_else(|_| "gongbus_secret".to_string()),
     };
 
+    let gemini_model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-3.6-flash".to_string());
+
     let opt: PgConnectOptions = db_url.parse().expect("Invalid DATABASE_URL");
     let opt = opt.disable_statement_logging()
         .statement_cache_capacity(0);
@@ -210,7 +213,7 @@ async fn main() {
         .expect("Failed to create database pool");
     info!("Database connection established.");
 
-    let state = AppState { db: pool, cloudinary_config, strava_config };
+    let state = AppState { db: pool, cloudinary_config, strava_config, gemini_model };
 
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
@@ -976,7 +979,7 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
     } else if provider == "gemini" {
         let client = reqwest::Client::new();
         // Switched to v1 stable API
-        let url = format!("https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={}", api_key);
+        let url = format!("https://generativelanguage.googleapis.com/v1/models/{}:generateContent?key={}", state.gemini_model, api_key);
         let combined_prompt = format!("System Instruction: {}\n\nUser Question: {}", context_prompt, payload.message);
 
         info!("Calling Gemini API for user {}...", row.get::<String, _>("username"));
