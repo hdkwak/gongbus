@@ -991,10 +991,7 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
                 }],
                 "generationConfig": {
                     "temperature": 0.7,
-                    "maxOutputTokens": 2048,
-                    "thinkingConfig": {
-                        "thinkingBudget": 0
-                    }
+                    "maxOutputTokens": 2048
                 }
             }))
             .send().await.map_err(|e| {
