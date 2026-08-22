@@ -149,7 +149,7 @@ struct UserProfile {
     ai_api_key: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, FromRow)]
 struct ChatMessage {
     role: String,
     message: String,
