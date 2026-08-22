@@ -924,11 +924,20 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
         "You are a professional running coach for {}.
         User's Goal: {} in {} marathon.
         Race Date: {}.
-        Latest Run: {} km, Duration: {}, Avg HR: {:?}, Avg Cadence: {:?}.
+        Latest Run Stats:
+        - Distance: {:.2} km
+        - Duration: {}
+        - Avg HR: {} bpm
+        - Avg Cadence: {} spm
         Analyze this run and provide actionable, motivating feedback.",
-        row.get::<String, _>("username"), goal_time, row.get::<Option<String>, _>("target_race").unwrap_or_default(),
-        row.get::<Option<chrono::NaiveDate>, _>("race_date").map(|d| d.to_string()).unwrap_or_default(),
-        dist_km, duration, row.get::<Option<i32>, _>("avg_heart_rate"), row.get::<Option<i32>, _>("avg_cadence")
+        row.get::<String, _>("username"),
+        goal_time,
+        row.get::<Option<String>, _>("target_race").unwrap_or_else(|| "N/A".to_string()),
+        row.get::<Option<chrono::NaiveDate>, _>("race_date").map(|d| d.to_string()).unwrap_or_else(|| "N/A".to_string()),
+        dist_km,
+        duration,
+        row.get::<Option<i32>, _>("avg_heart_rate").map(|v| v.to_string()).unwrap_or_else(|| "N/A".to_string()),
+        row.get::<Option<i32>, _>("avg_cadence").map(|v| v.to_string()).unwrap_or_else(|| "N/A".to_string())
     );
 
     // 3. Call AI Provider
@@ -949,20 +958,17 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
             })?;
 
         if !resp.status().is_success() {
-            let err_text = resp.text().await.unwrap_or_default();
-            error!("OpenAI API error: {}", err_text);
-            return Err((StatusCode::BAD_GATEWAY, format!("OpenAI API error: {}", err_text)));
+            let err_json: serde_json::Value = resp.json().await.unwrap_or_default();
+            let err_msg = err_json["error"]["message"].as_str().unwrap_or("Unknown OpenAI error");
+            return Err((StatusCode::BAD_GATEWAY, err_msg.to_string()));
         }
 
-        let json: serde_json::Value = resp.json().await.map_err(|e| {
-            error!("Failed to parse OpenAI response: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to parse AI response".to_string())
-        })?;
+        let json: serde_json::Value = resp.json().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         json["choices"][0]["message"]["content"].as_str().unwrap_or("Error calling AI").to_string()
     } else if provider == "gemini" {
         let client = reqwest::Client::new();
         let url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}", api_key);
-        let combined_prompt = format!("{}\n\nUser Question: {}", context_prompt, payload.message);
+        let combined_prompt = format!("System Instruction: {}\n\nUser Question: {}", context_prompt, payload.message);
         let resp = client.post(url)
             .json(&serde_json::json!({
                 "contents": [{
@@ -975,9 +981,9 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
             })?;
 
         if !resp.status().is_success() {
-            let err_text = resp.text().await.unwrap_or_default();
-            error!("Gemini API error: {}", err_text);
-            return Err((StatusCode::BAD_GATEWAY, format!("Gemini API error: {}", err_text)));
+            let err_json: serde_json::Value = resp.json().await.unwrap_or_default();
+            let err_msg = err_json["error"]["message"].as_str().unwrap_or("Unknown Gemini error");
+            return Err((StatusCode::BAD_GATEWAY, err_msg.to_string()));
         }
 
         let json: serde_json::Value = resp.json().await.map_err(|e| {
@@ -1009,15 +1015,12 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
             })?;
 
         if !resp.status().is_success() {
-            let err_text = resp.text().await.unwrap_or_default();
-            error!("Claude API error: {}", err_text);
-            return Err((StatusCode::BAD_GATEWAY, format!("Claude API error: {}", err_text)));
+            let err_json: serde_json::Value = resp.json().await.unwrap_or_default();
+            let err_msg = err_json["error"]["message"].as_str().unwrap_or("Unknown Claude error");
+            return Err((StatusCode::BAD_GATEWAY, err_msg.to_string()));
         }
 
-        let json: serde_json::Value = resp.json().await.map_err(|e| {
-            error!("Failed to parse Claude response: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to parse AI response".to_string())
-        })?;
+        let json: serde_json::Value = resp.json().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         json["content"][0]["text"].as_str().unwrap_or("Error calling Claude").to_string()
     } else {
         return Err((StatusCode::BAD_REQUEST, "Unsupported AI provider".to_string()));
