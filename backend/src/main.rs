@@ -943,9 +943,21 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
                     {"role": "user", "content": payload.message}
                 ]
             }))
-            .send().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .send().await.map_err(|e| {
+                error!("OpenAI connection error: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("OpenAI connection error: {}", e))
+            })?;
 
-        let json: serde_json::Value = resp.json().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !resp.status().is_success() {
+            let err_text = resp.text().await.unwrap_or_default();
+            error!("OpenAI API error: {}", err_text);
+            return Err((StatusCode::BAD_GATEWAY, format!("OpenAI API error: {}", err_text)));
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| {
+            error!("Failed to parse OpenAI response: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to parse AI response".to_string())
+        })?;
         json["choices"][0]["message"]["content"].as_str().unwrap_or("Error calling AI").to_string()
     } else if provider == "gemini" {
         let client = reqwest::Client::new();
@@ -957,10 +969,27 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
                     "parts": [{"text": combined_prompt}]
                 }]
             }))
-            .send().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .send().await.map_err(|e| {
+                error!("Gemini connection error: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Gemini connection error: {}", e))
+            })?;
 
-        let json: serde_json::Value = resp.json().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        json["candidates"][0]["content"]["parts"][0]["text"].as_str().unwrap_or("Error calling Gemini").to_string()
+        if !resp.status().is_success() {
+            let err_text = resp.text().await.unwrap_or_default();
+            error!("Gemini API error: {}", err_text);
+            return Err((StatusCode::BAD_GATEWAY, format!("Gemini API error: {}", err_text)));
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| {
+            error!("Failed to parse Gemini response: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to parse AI response".to_string())
+        })?;
+
+        json["candidates"][0]["content"]["parts"][0]["text"].as_str()
+            .ok_or_else(|| {
+                error!("Unexpected Gemini response structure: {:?}", json);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Invalid AI response structure".to_string())
+            })?.to_string()
     } else if provider == "claude" {
         let client = reqwest::Client::new();
         let resp = client.post("https://api.anthropic.com/v1/messages")
@@ -974,9 +1003,21 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
                     {"role": "user", "content": payload.message}
                 ]
             }))
-            .send().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .send().await.map_err(|e| {
+                error!("Claude connection error: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Claude connection error: {}", e))
+            })?;
 
-        let json: serde_json::Value = resp.json().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !resp.status().is_success() {
+            let err_text = resp.text().await.unwrap_or_default();
+            error!("Claude API error: {}", err_text);
+            return Err((StatusCode::BAD_GATEWAY, format!("Claude API error: {}", err_text)));
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| {
+            error!("Failed to parse Claude response: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to parse AI response".to_string())
+        })?;
         json["content"][0]["text"].as_str().unwrap_or("Error calling Claude").to_string()
     } else {
         return Err((StatusCode::BAD_REQUEST, "Unsupported AI provider".to_string()));
