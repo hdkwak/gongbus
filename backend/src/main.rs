@@ -843,9 +843,60 @@ async fn update_activity(State(state): State<AppState>, Path(id): Path<i32>, Jso
     Ok(StatusCode::OK)
 }
 
+async fn sync_activity(State(state): State<AppState>, Json(payload): Json<ActivityDetail>) -> Result<StatusCode, (StatusCode, String)> {
+    let db = state.get_db().await?;
+
+    // Convert GeoJSON to WKT for PostGIS if provided
+    let route_wkt = if let Some(geojson) = payload.route_line_geojson {
+        // Simple conversion for LineString
+        let coords = geojson.get("coordinates").and_then(|c| c.as_array());
+        if let Some(arr) = coords {
+            let points: Vec<String> = arr.iter().filter_map(|p| {
+                let p_arr = p.as_array()?;
+                Some(format!("{} {}", p_arr[0], p_arr[1]))
+            }).collect();
+            if points.len() >= 2 {
+                Some(format!("LINESTRING({})", points.join(",")))
+            } else { None }
+        } else { None }
+    } else { None };
+
+    sqlx::query(
+        r#"INSERT INTO activities
+           (user_id, title, start_time, distance_meters, duration_seconds, route_line,
+            avg_heart_rate, max_heart_rate, avg_cadence, total_calories, strava_id)
+           VALUES ($1, $2, $3, $4, $5, ST_GeomFromText($6, 4326), $7, $8, $9, $10, $11)
+           ON CONFLICT (user_id, start_time) DO UPDATE SET
+           title = EXCLUDED.title,
+           distance_meters = EXCLUDED.distance_meters,
+           duration_seconds = EXCLUDED.duration_seconds,
+           route_line = EXCLUDED.route_line,
+           avg_heart_rate = EXCLUDED.avg_heart_rate,
+           max_heart_rate = EXCLUDED.max_heart_rate,
+           avg_cadence = EXCLUDED.avg_cadence,
+           total_calories = EXCLUDED.total_calories,
+           strava_id = EXCLUDED.strava_id"#
+    )
+    .bind(payload.user_id)
+    .bind(&payload.title)
+    .bind(payload.start_time)
+    .bind(payload.distance_meters)
+    .bind(payload.duration_seconds)
+    .bind(route_wkt)
+    .bind(payload.avg_heart_rate)
+    .bind(payload.max_heart_rate)
+    .bind(payload.avg_cadence)
+    .bind(payload.total_calories)
+    .bind(payload.strava_id)
+    .execute(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(StatusCode::CREATED)
+}
+
 async fn get_chat_history(State(state): State<AppState>, Path(activity_id): Path<i32>) -> Result<Json<Vec<ChatMessage>>, (StatusCode, String)> {
     let db = state.get_db().await?;
-    let history = sqlx::query_as!(ChatMessage, "SELECT role, message, created_at FROM activity_chats WHERE activity_id = $1 ORDER BY created_at ASC", activity_id)
+    let history = sqlx::query_as::<_, ChatMessage>("SELECT role, message, created_at FROM activity_chats WHERE activity_id = $1 ORDER BY created_at ASC")
+        .bind(activity_id)
         .fetch_all(&db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(history))
 }
@@ -853,17 +904,21 @@ async fn get_chat_history(State(state): State<AppState>, Path(activity_id): Path
 async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32>, Json(payload): Json<ChatRequest>) -> Result<Json<ChatMessage>, (StatusCode, String)> {
     let db = state.get_db().await?;
 
-    // 1. Get Activity & User Context
-    let activity = sqlx::query!("SELECT a.*, u.username, u.marathon_goal_sec, u.target_race, u.race_date, u.ai_provider, u.ai_api_key FROM activities a JOIN users u ON a.user_id = u.id WHERE a.id = $1", activity_id)
-        .fetch_one(&db).await.map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    // 1. Get Activity & User Context (using non-macro query)
+    let row = sqlx::query(
+        "SELECT a.distance_meters, a.duration_seconds, a.avg_heart_rate, a.avg_cadence,
+                u.username, u.marathon_goal_sec, u.target_race, u.race_date, u.ai_provider, u.ai_api_key, u.id as user_id
+         FROM activities a JOIN users u ON a.user_id = u.id WHERE a.id = $1"
+    ).bind(activity_id).fetch_one(&db).await.map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    let api_key = activity.ai_api_key.ok_or((StatusCode::BAD_REQUEST, "No AI API Key found in profile".to_string()))?;
-    let provider = activity.ai_provider.unwrap_or_else(|| "openai".to_string());
+    let api_key: String = row.get::<Option<String>, _>("ai_api_key").ok_or((StatusCode::BAD_REQUEST, "No AI API Key found in profile".to_string()))?;
+    let provider: String = row.get::<Option<String>, _>("ai_provider").unwrap_or_else(|| "openai".to_string());
+    let user_id: i32 = row.get("user_id");
 
     // 2. Build Contextual Prompt
-    let goal_time = activity.marathon_goal_sec.map(|s| format!("{}h {}m", s/3600, (s%3600)/60)).unwrap_or_else(|| "N/A".to_string());
-    let dist_km = activity.distance_meters.unwrap_or(0) as f64 / 1000.0;
-    let duration = format!("{} min", activity.duration_seconds.unwrap_or(0) / 60);
+    let goal_time = row.get::<Option<i32>, _>("marathon_goal_sec").map(|s| format!("{}h {}m", s/3600, (s%3600)/60)).unwrap_or_else(|| "N/A".to_string());
+    let dist_km = row.get::<Option<i32>, _>("distance_meters").unwrap_or(0) as f64 / 1000.0;
+    let duration = format!("{} min", row.get::<Option<i32>, _>("duration_seconds").unwrap_or(0) / 60);
 
     let context_prompt = format!(
         "You are a professional running coach for {}.
@@ -871,8 +926,9 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
         Race Date: {}.
         Latest Run: {} km, Duration: {}, Avg HR: {:?}, Avg Cadence: {:?}.
         Analyze this run and provide actionable, motivating feedback.",
-        activity.username, goal_time, activity.target_race.unwrap_or_default(), activity.race_date.map(|d| d.to_string()).unwrap_or_default(),
-        dist_km, duration, activity.avg_heart_rate, activity.avg_cadence
+        row.get::<String, _>("username"), goal_time, row.get::<Option<String>, _>("target_race").unwrap_or_default(),
+        row.get::<Option<chrono::NaiveDate>, _>("race_date").map(|d| d.to_string()).unwrap_or_default(),
+        dist_km, duration, row.get::<Option<i32>, _>("avg_heart_rate"), row.get::<Option<i32>, _>("avg_cadence")
     );
 
     // 3. Call AI Provider
@@ -927,10 +983,10 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
     };
 
     // 4. Save to Database
-    sqlx::query!("INSERT INTO activity_chats (activity_id, user_id, role, message) VALUES ($1, $2, $3, $4)",
-        activity_id, activity.user_id, "user", payload.message).execute(&db).await.ok();
-    sqlx::query!("INSERT INTO activity_chats (activity_id, user_id, role, message) VALUES ($1, $2, $3, $4)",
-        activity_id, activity.user_id, "assistant", ai_response).execute(&db).await.ok();
+    sqlx::query("INSERT INTO activity_chats (activity_id, user_id, role, message) VALUES ($1, $2, $3, $4)")
+        .bind(activity_id).bind(user_id).bind("user").bind(&payload.message).execute(&db).await.ok();
+    sqlx::query("INSERT INTO activity_chats (activity_id, user_id, role, message) VALUES ($1, $2, $3, $4)")
+        .bind(activity_id).bind(user_id).bind("assistant").bind(&ai_response).execute(&db).await.ok();
 
     Ok(Json(ChatMessage { role: "assistant".to_string(), message: ai_response, created_at: Some(chrono::Utc::now()) }))
 }
