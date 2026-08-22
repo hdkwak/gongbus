@@ -988,7 +988,10 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
                 }],
                 "generationConfig": {
                     "temperature": 0.7,
-                    "maxOutputTokens": 1024,
+                    "maxOutputTokens": 2048,
+                    "thinkingConfig": {
+                        "thinkingBudget": 0
+                    }
                 }
             }))
             .send().await.map_err(|e| {
@@ -1013,6 +1016,11 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
             error!("Failed to parse Gemini JSON response: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Invalid response from AI provider".to_string())
         })?;
+
+        let finish_reason = json["candidates"][0]["finishReason"].as_str().unwrap_or("");
+        if finish_reason == "MAX_TOKENS" {
+            error!("Gemini response was truncated by maxOutputTokens. Full response: {:?}", json);
+        }
 
         json["candidates"][0]["content"]["parts"][0]["text"].as_str()
             .ok_or_else(|| {
