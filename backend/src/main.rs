@@ -976,7 +976,7 @@ async fn ask_ai_coach(State(state): State<AppState>, Path(activity_id): Path<i32
     } else if provider == "gemini" {
         let client = reqwest::Client::new();
         // Switched to v1 stable API
-        let url = format!("https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={}", api_key);
+        let url = format!("https://generativelanguage.googleapis.com/v1/models/gemini-3.7-flash:generateContent?key={}", api_key);
         let combined_prompt = format!("System Instruction: {}\n\nUser Question: {}", context_prompt, payload.message);
 
         info!("Calling Gemini API for user {}...", row.get::<String, _>("username"));
